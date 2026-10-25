@@ -145,7 +145,8 @@ python tg.py sync --dry-run       # 只报数，不写账本、不动游标
 会明说，别把那次的 tok 数当成"会话总共跑了多少"（那看 `tg ctx`）。
 
 记完账，`tg report` 的「钱」那一栏才有真数（`spend` 只记 token，记不到钱）；没有 `cost`
-的账本会明说"账本里没有 cost"，不会拿 token 数硬折成钱。
+的账本会明说"账本里没有 cost"，不会拿 token 数硬折成钱。`tg done` 也会在收尾时拉你一把：
+宿主就在本机、这步却没对过账，它会提醒先 `sync` 再标记完成。
 
 ---
 
@@ -239,11 +240,11 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 ```bash
 python tests/test_tg.py        # 53 项：计划 / 门禁 / 预算口径 / 兼容
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
-python tests/test_sync.py      # 49 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report 的钱
+python tests/test_sync.py      # 53 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒
 python tests/smoke_serve.py    # 14 项：真起服务、真打请求、Host 头校验
 ```
 
-合计 **141 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **145 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 ---
 

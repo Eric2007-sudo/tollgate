@@ -910,9 +910,13 @@ def cmd_done(a):
     append_ledger(root, {"ts": now_iso(), "step": a.n, "in": 0, "out": 0,
                          "note": "DONE" + (" (forced)" if failed else "")})
     save(root, plan)
-    used = spent_for(load_ledger(root), a.n)
+    ledger = load_ledger(root)
+    used = spent_for(ledger, a.n)
     out("#%d %s 完成。实耗 %s / 预算 %s"
         % (s["n"], s["title"], fmt_k(used), fmt_k(s.get("budget", 0))))
+    if opencode_db() is not None and cost_for(ledger, a.n)[0] is None:
+        warn("这一步账本里没有真实用量。宿主就在本机——先 tg sync 再 done，"
+             "否则「实耗」只是手记的 token 数，「到底花了多少钱」没人知道。")
 
     nxt = next((x for x in plan["steps"]
                 if x["status"] != "done" and _deps_done(plan, x)[0]), None)

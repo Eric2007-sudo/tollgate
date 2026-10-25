@@ -286,6 +286,18 @@ def main():
     expect("账本里没有 cost" in body, "report 明说账本里没有 cost")
     expect("tg sync" in body, "并指路到 sync")
 
+    # ---------- 13. done 时提醒没对账的步骤（闸一收尾顺手拉闸二一把） ----------
+    tmp10 = case("13 done 提醒对账", TURNS3)
+    r = run(tmp10, ["done", "1"])
+    expect(r.returncode == 0, "没有 accept 断言时 done 直接过")
+    expect("没有真实用量" in (r.stdout + r.stderr), "done 提醒先跑 tg sync")
+
+    tmp11 = case("14 对账后 done 不再唠叨", TURNS3)
+    run(tmp11, ["sync"])
+    r = run(tmp11, ["done", "1"])
+    expect(r.returncode == 0, "sync 之后 done 仍然过")
+    expect("没有真实用量" not in (r.stdout + r.stderr), "sync 之后 done 不再提醒")
+
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:
         print("  - " + m)
