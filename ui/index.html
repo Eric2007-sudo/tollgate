@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tollgate 工作台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">tollgate<span class="sub">过闸 · 计划预算 / 上下文预算 / 账本</span></div>
+  <div class="meta"><span id="ts">–</span></div>
+</header>
+
+<main>
+  <section class="cards" id="cards"></section>
+
+  <section class="panel">
+    <h2>这一轮：上下文与钱</h2>
+    <div id="ctx" class="ctx"></div>
+  </section>
+
+  <section class="panel">
+    <h2>计划</h2>
+    <div id="goal" class="goal"></div>
+    <div class="tablewrap"><table id="steps"></table></div>
+  </section>
+</main>
+
+<footer>
+  <button id="sample">记一笔采样</button>
+  <span id="status" class="status"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,116 @@
+# tollgate 架构
+
+## 一句话
+
+一个文件（`tg.py`）+ 一层静态页（`ui/`）。左边管计划，右边管上下文，两边共用一个数据底座。
+
+```
+                       ┌────────────────────────────────────────────┐
+                       │                tg.py（单文件 CLI）           │
+                       │                                            │
+  .plan/plan.json ◀──▶ │  基础设施  find_root / paths / load / save  │
+  .plan/ledger.jsonl◀─▶│  渲染     render / plan.md                  │
+  .plan/ctx.jsonl  ◀──▶│  断言     run_check / run_gates             │
+                       │  命令     cmd_*(24 个)                      │
+                       └───────┬──────────────────────┬─────────────┘
+                               │                      │
+            闸一：plan 模型      │                      │  闸二：用量模型
+            （磁盘上的契约）     │                      │  （宿主的账本）
+                               ▼                      ▼
+                    ┌──────────────────┐   ┌──────────────────────────┐
+                    │ .plan/plan.json  │   │ opencode.db（只读 URI）   │
+                    │ ├ steps[]        │   │ ├ session_v2     累计     │
+                    │ │  out / accept  │   │ ├ session_message 逐轮    │
+                    │ │  budget/rounds │   │ └ message       旧布局兜底 │
+                    │ └ exclude[]      │   │                          │
+                    └──────────────────┘   │ opencode.json（价目表）    │
+                                           └──────────────────────────┘
+```
+
+## 三个数据面的关系
+
+| 面 | 谁写 | 谁读 | 作用 |
+|---|---|---|---|
+| `.plan/plan.json` | `init` / `add` / `amend` | 全部命令、看板 | **唯一的计划真相** |
+| `.plan/ledger.jsonl` | `spend` / `gate` / `done` / `reset` | `report` / 看板 | 只追加的审计流水 |
+| `opencode.db` | 宿主（OpenCode）自己 | `ctx` / `price` / 看板 | 真实 token 与钱，**只读** |
+
+关键约束：**tollgate 从不写宿主的库**。`opencode.db` 用 `file:<path>?mode=ro` 打开，避免和正在跑的会话抢锁。反过来，宿主也从不知道 tollgate 的存在——这是"能随时卸载"的前提。
+
+## `tg.py` 的分区
+
+文件按固定顺序分段，每段前面有 `# ---- 分隔注释`：
+
+| 段 | 内容 |
+|---|---|
+| 头部 docstring | 版本、四个设计约束、向后兼容承诺 |
+| 基础设施 | `find_root`（向上找 `.plan/`）、`paths`、`load`、`save`、`append_ledger`、`sh`、`git_drift` |
+| 渲染 | `render` 把 plan.json 渲成 plan.md |
+| 断言 | `parse_pair`、`run_check`、`run_gates`、`gate_report` |
+| 命令 | 21 个闸一命令 |
+| **价格与账本** | `opencode_config` / `load_prices` / `opencode_db` / `read_sessions` / `current_session` / `cost_usd` |
+| **逐轮数据** | `read_turns`（解析消息里的 `tokens`）/ `growth_rate`（中位数增速） |
+| **上下文报告** | `ctx_report`（唯一的口径聚合点）/ `cmd_ctx` / `cmd_price` |
+| **工作台** | `state_payload`（把上面全部打包成 JSON）/ `_make_handler` / `cmd_serve` |
+| 入口 | argparse，24 个子命令 |
+
+## 一次 `tg ctx` 的数据流
+
+```
+current_session()          挑会话：--session > $OPENCODE_SESSION_ID > 最近更新
+      │
+      ├── read_turns(sid)  读 session_message + message，解析 tokens
+      │        │
+      │        ├── 最后一行 → 本轮上下文 = input + cache.read
+      │        └── 近 8 行 → growth_rate() 中位差分 → 还有几轮撞 90% 窗口
+      │
+      ├── load_prices()    opencode.json 里各模型的 cost / limit.context
+      │
+      ├── cost_usd()       与宿主同口径：reasoning 按输出价
+      │
+      └── verdict[]        规则化判断，每条都可解释、都可回指到某个数字
+```
+
+`ctx` 的每条判断都必须能指回一个具体数字（窗口百分比、命中率、增速、轮数）。**指不回去的话就不说。**
+
+## 三层兜底（为了保证不编数字）
+
+| 情况 | 用什么 | 输出 |
+|---|---|---|
+| 宿主有逐轮 tokens | `read_turns` | 精确单轮值 + 增速预测 |
+| 只有会话累计 | `.plan/ctx.jsonl` 两次采样差值 | 增量值，标注"两次采样以来" |
+| 什么也没有 | 计划里的 `--baseline-context` | 估计值，标注来源 |
+| 连估计也没有 | —— | `estimate.tokens = null`，明说"未知" |
+
+绝不把累计值冒充单轮值。这是这个项目最容易犯、也最致命的错误（曾经真的算出过"占窗口 28810%"）。
+
+## 工作台为什么是静态页
+
+`ui/` 里只有三个文件：`index.html` / `app.js` / `style.css`，没有任何构建链。
+
+- `GET /api/state` → `state_payload()` 打包好的 JSON（计划 + ctx + 价目 + 判断）
+- `GET /` `/app.js` `/style.css` → 白名单静态文件
+- `POST /api/sample` → 追一条采样
+
+安全边界：只绑 `127.0.0.1`，每个请求校验 `Host` 头（防 DNS rebinding），静态路径是白名单而非字符串拼接（防目录穿越）。
+
+页面每 3 秒轮询一次。不做 WebSocket，因为数据量小、延迟不重要，而 SSE/WS 会让"零依赖"这个约束破在部署上。
+
+## 加一个宿主适配器要改哪
+
+只改四个函数，其余不动：
+
+1. `opencode_db()` —— 返回库路径（或读 `TOLLGATE_DB`）
+2. `read_sessions()` —— 返回会话累计行，字段名照现有 dict
+3. `read_turns()` —— 返回逐轮 `tokens`
+4. `opencode_config()` / `load_prices()` —— 返回价目表
+
+`ctx_report` 之后的一切都不感知宿主差异，因为它们只吃标准化后的 dict。
+
+## 不变式
+
+1. `plan.json` 是唯一真源；`plan.md`、看板、`status` 都是它的视图
+2. `ledger.jsonl` / `ctx.jsonl` 只 append，不改写，不重排
+3. 门禁结论只来自子进程 `exit code`
+4. 宿主的库只读；不在别人的文件里留状态
+5. 任何"算不出来"的地方输出 `null` + 原因，不填近似值

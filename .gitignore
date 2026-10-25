@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.plan/
+.venv/
+venv/
+
+# 本机调试残留
+.ctx*.txt
+.t*.txt
+.t*.sum
+.schema.txt
+.help.txt
+.skillhead.txt
+.probe_schema.py
+.splice.py
+.newmid.py

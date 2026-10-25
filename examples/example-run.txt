@@ -1,0 +1,68 @@
+﻿# 闸一实操记录 —— 由 tg.py 真实执行产生，非手写
+
+$ tg init "把 pipeline.py 拆成可测模块" --why "现在改一处要跑全量，改动无法验证"
+已建立计划 `440ecb` → C:\Users\<user>\AppData\Local\Temp\tg_demo\.plan
+下一步：tg add --title "..." --tier cheap --budget 8000 --out notes/01-x.md --reuse existing --accept "file:exists:notes/01-x.md"
+
+$ tg add #1（复用梯子第 3 级：标准库已有 io）
+已加 #1 抽出 io 层（tier=cheap，预算 30k，复用=stdlib）
+
+$ tg add #2（复用梯子第 7 级：确实只能新写）
+已加 #2 把 fetch 拆成纯函数（tier=cheap，预算 25k，复用=new）
+
+$ tg add #3（复用梯子第 2 级：仓库里已有测试骨架）
+已加 #3 补回归测试（tier=std，预算 20k，复用=existing）
+
+$ tg ready
+#1 抽出 io 层  (tier=cheap, 预算 30k, 复用=stdlib)
+… #2 把 fetch 拆成纯函数  ← #1 还没完成
+… #3 补回归测试  ← #2 还没完成
+
+$ tg start 1
+#1 抽出 io 层 开始（第 1/3 轮，tier=cheap，预算 30k）
+请求轮数上限：3 轮（超了就 block，别硬撑）
+产物必须落在：src/io.py
+停止条件：pipeline.py 超过 800 行就停，先汇报
+完成前跑：tg gate 1
+
+$ tg spend 1 --in 12000 --out 900 --reqs 1
+#1 累计 12.9k / 30k（43%）
+   轮次：1 轮（预算 3 轮） ｜ 单轮平均 12.9k
+
+$ tg gate 1        # 还没写产物：断言必须拦住
+[2026-10-25T13:25:35] gate #1 抽出 io 层
+  FAIL  file:exists:src/io.py
+      exists -> C:\Users\<user>\AppData\Local\Temp\tg_demo\src\io.py
+  FAIL  cmd:python -m py_compile src/io.py
+      exit=1  [Errno 2] No such file or directory: 'src/io.py'
+
+gate 失败 2 条。修完再跑，不要 tg done。
+
+$ tg done 1        # 门禁没过 → 拒绝完成
+拒绝标记完成：gate 未通过
+  FAIL  file:exists:src/io.py   (exists -> C:\Users\<user>\AppData\Local\Temp\tg_demo\src\io.py)
+  FAIL  cmd:python -m py_compile src/io.py   (exit=1  [Errno 2] No such file or directory: 'src/io.py')
+
+要么修到通过，要么显式 tg done 1 --force（会记进 ledger）
+
+$ tg gate 1        # 产物到位：断言放行
+[2026-10-25T13:25:36] gate #1 抽出 io 层
+  PASS  file:exists:src/io.py
+      exists -> C:\Users\<user>\AppData\Local\Temp\tg_demo\src\io.py
+  PASS  cmd:python -m py_compile src/io.py
+      exit=0  
+
+gate 通过 2 条。
+
+$ tg done 1
+#1 抽出 io 层 完成。实耗 12.9k / 预算 30k
+下一步：#2 把 fetch 拆成纯函数（tier=cheap）
+
+$ tg status
+[PLAN 440ecb] 目标: 把 pipeline.py 拆成可测模块
+进度: 1/3 · 预算 12.9k/75k (17%) · 卡点 0
+当前: #2 把 fetch 拆成纯函数 (tier=cheap, 预算 25k)
+产物: src/fetch.py
+停止条件: 测试里出现真实网络请求就停
+禁读: （未设置 → 建议补）
+提示: tg show 看全文 · tg handoff N 发给便宜模型 · 完成必须 gate 通过

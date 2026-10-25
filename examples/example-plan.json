@@ -1,0 +1,84 @@
+{
+ "schema": 2,
+ "id": "440ecb",
+ "goal": "把 pipeline.py 拆成可测模块",
+ "why": "现在改一处要跑全量，改动无法验证",
+ "created": "2026-10-25T13:25:33",
+ "updated": "2026-10-25T13:25:36",
+ "git_head": "",
+ "max_rounds": 3,
+ "baseline_context": 0,
+ "exclude": [],
+ "acks": [],
+ "steps": [
+  {
+   "n": 1,
+   "title": "抽出 io 层",
+   "tier": "cheap",
+   "budget": 30000,
+   "out": "src/io.py",
+   "read": [
+    "scripts/pipeline.py"
+   ],
+   "reuse": "stdlib",
+   "depends": [],
+   "stop": [
+    "pipeline.py 超过 800 行就停，先汇报"
+   ],
+   "accept": [
+    "file:exists:src/io.py",
+    "cmd:python -m py_compile src/io.py"
+   ],
+   "status": "done",
+   "rounds": 1,
+   "budget_rounds": 3,
+   "note": ""
+  },
+  {
+   "n": 2,
+   "title": "把 fetch 拆成纯函数",
+   "tier": "cheap",
+   "budget": 25000,
+   "out": "src/fetch.py",
+   "read": [],
+   "reuse": "new",
+   "depends": [
+    1
+   ],
+   "stop": [
+    "测试里出现真实网络请求就停"
+   ],
+   "accept": [
+    "file:exists:src/fetch.py",
+    "nogrep:requests.get@src/fetch.py"
+   ],
+   "status": "todo",
+   "rounds": 0,
+   "budget_rounds": 4,
+   "note": "仓库里没有可复用的 fetch 层，前六级都不成立"
+  },
+  {
+   "n": 3,
+   "title": "补回归测试",
+   "tier": "std",
+   "budget": 20000,
+   "out": "tests/test_fetch.py",
+   "read": [],
+   "reuse": "existing",
+   "depends": [
+    2
+   ],
+   "stop": [
+    "断言与现有测试冲突就停，先汇报"
+   ],
+   "accept": [
+    "file:exists:tests/test_fetch.py",
+    "file:absent:scripts/old_fetch.py"
+   ],
+   "status": "todo",
+   "rounds": 0,
+   "budget_rounds": 3,
+   "note": ""
+  }
+ ]
+}
