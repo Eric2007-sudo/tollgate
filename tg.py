@@ -2007,7 +2007,7 @@ def sync_path(root):
 
 def load_sync(root):
     """读取同步游标：已入账的消息 id 集合。空/坏文件一律当「从没同步过」。"""
-    blank = {"session": "", "ids": []}
+    blank = {"session": "", "ids": [], "updated": ""}
     p = sync_path(root)
     if not p.is_file():
         return blank
@@ -2021,6 +2021,7 @@ def load_sync(root):
     return {
         "session": str(d.get("session") or ""),
         "ids": [str(x) for x in ids] if isinstance(ids, list) else [],
+        "updated": str(d.get("updated") or ""),
     }
 
 
@@ -2198,17 +2199,49 @@ def state_payload(root):
     rep = ctx_report(root)
     steps = []
     for s in plan.get("steps", []):
+        cash, _ = cost_for(ledger, s["n"])
         steps.append({
             "n": s["n"], "title": s["title"], "status": s["status"],
             "tier": s.get("tier", ""), "out": s.get("out", ""),
             "budget": s.get("budget", 0), "spent": spent_for(ledger, s["n"]),
             "budget_rounds": s.get("budget_rounds", 0),
             "reqs": reqs_for(ledger, s["n"]),
+            "usd": cash,
             "accept": s.get("accept", []), "note": s.get("note", ""),
             "depends": s.get("depends", []),
         })
     total_budget = sum(s["budget"] for s in steps)
     total_spent = sum(s["spent"] for s in steps)
+
+    # 钱：只认账本里真实记过的 cost。一笔都没有就报 null，让前端去说「没有」，
+    # 而不是拿 token 数按当前单价硬折一个看起来很像真的数字。
+    usd_total, usd_rows = cost_for(ledger)
+    usd_rounds = sum(r.get("reqs", 0) for r in ledger if r.get("cost"))
+    money = {
+        "ledger_usd": usd_total,
+        "rows": usd_rows,
+        "rounds": usd_rounds,
+        "est_rows": sum(1 for r in ledger if r.get("cost") and r.get("cost_est")),
+        "per_round_usd": (usd_total / usd_rounds) if (usd_total and usd_rounds) else None,
+        "host_usd": (rep.get("cumulative") or {}).get("usd_db"),
+    }
+
+    # 对账状态：只看手上这 40 轮窗口里还有几轮没入账 —— 窗口外的东西看板也不该假装知道。
+    state = load_sync(root)
+    sid = (rep.get("session") or {}).get("session") or ""
+    seen = set(state["ids"])
+    pending = None
+    if sid:
+        pending = sum(1 for t in read_turns(sid, limit=CTX_WINDOW)
+                      if t["id"] not in seen)
+    syncing = {
+        "session": state["session"],
+        "synced_ids": len(state["ids"]),
+        "updated": state.get("updated", ""),
+        "same_session": bool(sid) and state["session"] == sid,
+        "pending_in_window": pending,
+    }
+
     return {
         "goal": plan.get("goal", ""),
         "why": plan.get("why", ""),
@@ -2223,6 +2256,8 @@ def state_payload(root):
             "done": sum(1 for s in steps if s["status"] == "done"),
             "ledger_rows": len(ledger),
         },
+        "money": money,
+        "sync": syncing,
         "ctx": rep,
         "ts": now_iso(),
     }

@@ -175,11 +175,16 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 
 `tg serve` 起一个只绑 `127.0.0.1` 的只读看板（校验 Host 头，防 DNS rebinding），一屏看到：
 
-- 计划进度条、每步预算 vs 已用、轮数是否超预算
+- 计划进度条、每步预算 vs 已用、轮数是否超预算、**每步的真实花费**
+- **账本花费**：只认账本里宿主记过的 `cost`；一笔都没有时显示「没有」，不拿 token 折算
+- **对账状态**：上次对账时间 + 这 40 轮窗口里还有几轮没入账（`pending_in_window`）
 - 本轮上下文占窗口的比例（过半变黄，八成变红）
 - **按近 8 轮中位增速，还有几轮撞到 90% 窗口**
 - 最近 16 轮的上下文柱状趋势（悬停显示每轮花费与命中率）
 - 判断清单：这一轮该 handoff、该修前缀、还是该继续
+
+「账本花费」是**上次 `sync` 那一刻**的快照，宿主累计（`ctx.cumulative`）一直在涨——两者差多少
+≈ 上次对账之后又跑掉的钱。看板把「截至上次 sync」写在卡片上，不假装自己实时。
 
 它是一个静态页 + 一个 JSON 接口，没有构建步骤，没有前端依赖。
 
@@ -243,10 +248,10 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 python tests/test_tg.py        # 53 项：计划 / 门禁 / 预算口径 / 兼容
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 56 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报
-python tests/smoke_serve.py    # 14 项：真起服务、真打请求、Host 头校验
+python tests/smoke_serve.py    # 29 项：真起服务、真打请求、Host 头校验、钱与对账上屏
 ```
 
-合计 **148 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **163 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 ---
 

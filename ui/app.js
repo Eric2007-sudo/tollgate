@@ -27,6 +27,14 @@ function usd(v) {
 
 function pct(v) { return (v * 100).toFixed(1) + "%"; }
 
+function cash(v) { return v == null ? "—" : usd(v); }
+
+/* 表格里放不下「$0.000123（¥0.000823）」，只留金额；全文放 title */
+function usdShort(v) {
+  if (v == null) return "-";
+  return "$" + (v >= 0.01 ? v.toFixed(4) : v.toFixed(6));
+}
+
 function card(k, v, note) {
   var c = el("div", "card");
   c.appendChild(el("div", "k", k));
@@ -64,9 +72,19 @@ function renderCards(s) {
 
   box.appendChild(card("轮数", String(t.reqs), t.ledger_rows + " 条账本记录"));
 
+  var m = s.money || {};
+  if (m.ledger_usd != null) {
+    box.appendChild(card("账本花费", cash(m.ledger_usd),
+      m.rounds + " 轮 · 单轮 " + cash(m.per_round_usd) +
+      (m.est_rows ? " · 含 " + m.est_rows + " 笔估算" : "") + " · 截至上次 sync"));
+  } else {
+    box.appendChild(card("账本花费", "没有", "跑 tg sync 让宿主报账"));
+  }
+
   if (turn && turn.ctx_tokens) {
     box.appendChild(card("本轮上下文", fmtK(turn.ctx_tokens),
-      "第 " + (c.turns || "?") + " 轮 · 命中 " + pct(turn.cache_read / turn.ctx_tokens)));
+      (c.truncated ? "最近 " + c.turns + " 轮中的最后一轮" : "第 " + (c.turns || "?") + " 轮") +
+      " · 命中 " + pct(turn.cache_read / turn.ctx_tokens)));
   }
 
   var g = c && c.growth;
@@ -122,6 +140,17 @@ function renderCtx(s) {
     }
     kv("会话", (sess.session || "").slice(0, 20));
     kv("模型", (sess.provider || "?") + "/" + (sess.model || "?"));
+
+    var sy = s.sync || {};
+    if (sy.session) {
+      var pend = sy.pending_in_window;
+      var ptxt = pend == null ? "未知"
+              : (pend === 0 ? "已全部入账" : pend + " 轮未入账（跑 tg sync）");
+      kv("对账", (sy.same_session ? "" : "换了会话 · ") + ptxt +
+        (sy.updated ? " · " + sy.updated.replace("T", " ").slice(0, 16) : ""));
+    } else {
+      kv("对账", "还没 sync 过（账本里只有手记的数）");
+    }
     var ctxTokens = (turn && turn.ctx_tokens) || 0;
     if (c.turns) kv("逐轮数据", c.turns + " 轮可读");
     if (ctxTokens) {
@@ -192,7 +221,7 @@ function renderSteps(s) {
   var thead = el("thead");
   var hr = el("tr");
   [["#", "num"], ["状态", ""], ["步骤", ""], ["档", "t"], ["预算 tok", "num"],
-   ["已用 tok", "num"], ["轮", "num"]].forEach(function (c) {
+   ["已用 tok", "num"], ["轮", "num"], ["花费", "num"]].forEach(function (c) {
     var th = el("th", c[1] || null, c[0]);
     hr.appendChild(th);
   });
@@ -221,6 +250,10 @@ function renderSteps(s) {
     var reqs = el("td", "num" + (st.budget_rounds && st.reqs > st.budget_rounds ? " over" : ""),
       st.reqs + (st.budget_rounds ? " / " + st.budget_rounds : ""));
     tr.appendChild(reqs);
+
+    var ctd = el("td", "num", usdShort(st.usd));
+    if (st.usd != null) ctd.title = usd(st.usd);
+    tr.appendChild(ctd);
     tb.appendChild(tr);
   });
   t.appendChild(tb);

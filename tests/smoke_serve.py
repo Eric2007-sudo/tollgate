@@ -62,6 +62,24 @@ def main():
             expect(k in state, "/api/state 含字段 %s" % k)
         expect("session" in state.get("ctx", {}), "/api/state.ctx 含 session")
 
+        # 钱与对账：看板得能看见账本里的真实 cost，以及还有几轮没入账
+        for k in ("money", "sync"):
+            expect(k in state, "/api/state 含字段 %s" % k)
+        money = state.get("money") or {}
+        for k in ("ledger_usd", "rows", "rounds", "per_round_usd", "host_usd"):
+            expect(k in money, "/api/state.money 含 %s" % k)
+        syncing = state.get("sync") or {}
+        for k in ("session", "synced_ids", "updated", "same_session",
+                  "pending_in_window"):
+            expect(k in syncing, "/api/state.sync 含 %s" % k)
+        expect(money.get("ledger_usd") is None or money["ledger_usd"] >= 0,
+               "money.ledger_usd 要么是金额要么是 null（不编数）")
+
+        status, js = get("/app.js")
+        js = js.decode("utf-8", "replace")
+        expect("pending_in_window" in js, "前端用上了对账状态字段")
+        expect("账本花费" in js, "前端有「账本花费」卡片")
+
         for path, ctype in (("/", "text/html"), ("/app.js", "javascript"),
                             ("/style.css", "text/css")):
             status, body = get(path)
