@@ -247,11 +247,17 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 ```bash
 python tests/test_tg.py        # 53 项：计划 / 门禁 / 预算口径 / 兼容
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
-python tests/test_sync.py      # 56 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报
+python tests/test_sync.py      # 53 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报
 python tests/smoke_serve.py    # 29 项：真起服务、真打请求、Host 头校验、钱与对账上屏
 ```
 
-合计 **163 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **160 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+
+数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
+
+```bash
+python tests/check_doc_counts.py   # 真跑上面四个套件，核对 README 写的项目数与合计（不计入 160）
+```
 
 ---
 
