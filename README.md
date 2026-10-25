@@ -96,6 +96,10 @@ start  reset  block  spend  gate  done  handoff
 reconcile  report  ack  status  show  resume  drift
 ```
 
+`start` 还带 `--max-fanout N`：默认只允许 **2 步**同时 `doing`，而且**每路必须一个独立
+会话**。有 2 步 `doing` 时 `gate` / `sync` 不带编号会直接拒绝并把候选编号列出来——猜错
+等于给错的步骤发通行证、把两路的钱记到一步上。理由见局限 #18。
+
 **闸二 · 上下文与钱**
 
 ```
@@ -114,6 +118,11 @@ sync [--step N] [--dry-run] [--json]     把宿主逐轮真实用量写进账本
 每条命令的 stdout 上是**一个** JSON 对象，带 `"api": 1` 版本号；`gate --json` 失败时照样
 exit 1，`ok`/`exit` 字段与真退出码一致。编排层（`orch.py`）只吃这条契约，从不去抠人类可读
 输出里的数字——抠出来的数看着像真的，错的时候没人查得出来。
+
+`status --json` 里 **`doing` 是权威字段**（列表，可能有多项）；`current` 只是「第一个在跑的，
+或下一个该做的」。多路并发时别拿 `current` 当「谁在干活」——只看它会漏掉另一路的钱和轮数。
+`gate --json` 在多步 `doing` 且没点名时给 `ok: false`、`step: null`、`ambiguous: [编号…]`、
+退出码 2，而不是替你挑一个。
 
 ---
 
@@ -351,10 +360,12 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 17. `reconcile` 会把**所有**已完成步骤的门禁重跑一遍，所以计划里的慢断言会成倍放大时间
     （本仓 6 个步骤实测 352 秒，其中大半是两套全量测试）。它没有缓存、没有增量——「上次
     验过」不算数，这正是不骗人的代价。要给慢断言放宽时间用 `--timeout N`（`0` = 不限时）。
-18. `tg start` 只允许**一个**步骤同时 `doing`，所以真两路并发时第二路只能绕过 `start`、
-    收工后直接 `sync --step N --session <id>`（归属仍准确，但边界退化成计划 `created`）。
-    这是绕过来，不是支持——放宽成受 `max_fanout` 约束的多值还没进内核，`orch fan`
-    每次都会把这段话打出来，不让人误以为是官方姿势。
+18. `tg start` 允许最多 2 步同时 `doing`（`--max-fanout N` 可调高），但**前提是每路
+    一个独立会话**。两路塞进同一个会话里，轮次就混在一起了：`sync --step N` 点谁的名
+    都是猜——账是真的、归属是假的。所以 `tg start` 放行时当场警告；有 2 步 `doing` 时
+    `tg gate` / `tg sync` 不带编号会**直接拒绝**并把候选列出来，绝不「取第一个」。
+    上限本身不是性能旋钮：15× token 换 +90% 质量、头号失败模式是 cost runaway，
+    要更多路先回答「这几路各自产出的东西谁看、谁合、合不上怎么办」。
 19. `orch rollup` 不加 `--gate` 时**不做**断言与语义的打架检测（因为 `status=done` 只说明
     「当时过了」，代码可能已经变了），并且明说「没查」。所以默认模式的 rollup **不能**
     当验收证据；要证据就加 `--gate`，慢但是真数据。
@@ -379,19 +390,19 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 ## 测试
 
 ```bash
-python tests/test_tg.py        # 140 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝
+python tests/test_tg.py        # 171 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
-python tests/test_sync.py      # 106 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界
+python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
 python tests/test_orch.py      # 66 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态
 python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
 ```
 
-合计 **372 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **412 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 372）
+python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 412）
 ```
 
 ---

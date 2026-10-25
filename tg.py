@@ -109,6 +109,12 @@ TIMEOUT_TAG = "cmd 超时"
 # 加字段不升版，**改字段名或改含义必须 +1**。
 JSON_API = 1
 
+# 同时 `doing` 的步骤数上限。不是性能旋钮，是刹车。
+# 多智能体烧的是 token 不是时间：Anthropic 的多 agent 系统 +90.2% 质量但花 15× token，
+# MAST 查 1642 条轨迹里头号失败模式就是 cost runaway。要更多路，先回答
+# 「这几路各自产出的东西谁看、谁合、合不上怎么办」。
+MAX_FANOUT = 2
+
 TIERS = ("cheap", "std", "deep")
 
 # Ponytail 的梯子：从「不需要存在」到「必须新写」，越靠前越省钱
@@ -769,10 +775,26 @@ def cmd_start(a):
     if s["status"] == "done":
         die("#%d 已经是 done。真要重做，先 tg reset %d" % (a.n, a.n))
 
-    for other in plan["steps"]:
-        if other["status"] == "doing" and other["n"] != a.n:
-            die("#%d 还在 doing。一次只做一步，先 tg done %d 或 tg block %d"
-                % (other["n"], other["n"], other["n"]))
+    # 并发不是免费的速度：同时 doing 的步数有硬上限。
+    # 原先这里是「一次只做一步」，于是 A 阶段做真两路并发时只能绕过 start 直接
+    # `sync --step N --session <id>`——那一路没有 started_ms，归账边界退化成计划
+    # created。与其让人绕，不如把上限明说出来：要更多路，先回答谁看、谁合。
+    others = [o for o in plan["steps"]
+              if o["status"] == "doing" and o["n"] != a.n]
+    if others:
+        cap = a.max_fanout if a.max_fanout is not None else MAX_FANOUT
+        if len(others) + 1 > cap:
+            die("已经有 %d 步在 doing（%s），再开 #%d 就是 %d 路 > 上限 %d 路。\n"
+                "    并发的收益来自「先把契约写死 + 角色边界 = 目录边界」，不是来自同时跑；\n"
+                "    多智能体烧的是 token 不是时间（15× token 换 +90%% 质量，头号失败模式\n"
+                "    是 cost runaway）。先回答：这几路各自产出的东西谁看、谁合、合不上怎么办。\n"
+                "    答得上来：tg start %d --max-fanout %d"
+                % (len(others), "、".join("#%d" % o["n"] for o in others), a.n,
+                   len(others) + 1, cap, a.n, len(others) + 1))
+        alln = [o["n"] for o in others] + [a.n]
+        warn("现在 %d 步同时在 doing（%s）。多路并发时每路要用**独立会话**，"
+             "收工按会话分别归账：tg sync --step N --session <id>"
+             % (len(alln), "、".join("#%d" % x for x in alln)))
 
     ok, why = _deps_done(plan, s)
     if not ok and not a.force:
@@ -1013,7 +1035,22 @@ def cmd_gate(a):
     if a.n is not None:
         s = step_by_n(plan, a.n)
     else:
-        s = next((x for x in plan["steps"] if x["status"] == "doing"), None)
+        doing = [x for x in plan["steps"] if x["status"] == "doing"]
+        if len(doing) > 1:
+            # 猜错等于给错的步骤发通行证。多路并发时必须点名，不许「取第一个」。
+            nums = [x["n"] for x in doing]
+            msg = ("现在有 %d 步同时在 doing（%s）。不点名就不知道该验哪一步，"
+                   "而猜错等于给错的步骤发通行证 —— 用 tg gate N 指定。"
+                   % (len(nums), "、".join("#%d" % n for n in nums)))
+            if a.json:
+                jout({"api": JSON_API, "cmd": "gate", "ok": False,
+                      "step": None, "title": None, "checks": [],
+                      "passed": 0, "failed": 0, "timed": 0,
+                      "timeout_limit": a.timeout, "exit": 2,
+                      "note": msg, "ambiguous": nums})
+                sys.exit(2)
+            die(msg)
+        s = doing[0] if doing else None
         if s is None:
             todos = [x for x in plan["steps"] if x["status"] == "todo"]
             if not todos:
@@ -1136,7 +1173,8 @@ def cmd_status(a):
     spent = sum(r.get("in", 0) + r.get("out", 0) for r in ledger)
     pct = int(spent / budget * 100) if budget else 0
     blocked = [s for s in steps if s["status"] == "blocked"]
-    cur = next((s for s in steps if s["status"] == "doing"), None) \
+    doing = [s for s in steps if s["status"] == "doing"]
+    cur = (doing[0] if doing else None) \
         or next((s for s in steps
                  if s["status"] == "todo" and _deps_done(plan, s)[0]), None)
 
@@ -1189,7 +1227,16 @@ def cmd_status(a):
     out("[PLAN %s] 目标: %s" % (plan["id"], goal))
     out("进度: %d/%d · 预算 %s/%s (%d%%) · 卡点 %d"
         % (done, total, fmt_k(spent), fmt_k(budget), pct, len(blocked)))
-    if cur:
+    if len(doing) > 1:
+        # 「当前」不许在多路并发时只报一个：那样看起来像只有它在干活，
+        # 另一路的钱和轮数就没人盯着了。
+        out("当前: %d 步同时在跑 —— %s"
+            % (len(doing), "、".join("#%d %s" % (s["n"], s["title"])
+                                     for s in doing)))
+        for s in doing:
+            out("  #%d 产物: %s" % (s["n"], s.get("out", "-")))
+        out("  （每路要用独立会话；收工按会话归账：tg sync --step N --session <id>）")
+    elif cur:
         out("当前: #%d %s (tier=%s, 预算 %s)"
             % (cur["n"], cur["title"], cur["tier"], fmt_k(cur.get("budget", 0))))
         out("产物: %s" % cur.get("out", "-"))
@@ -1225,9 +1272,20 @@ def cmd_resume(a):
             out("  #%d %s → %s" % (s["n"], s["title"], s.get("out", "-")))
         if len(done) > 4:
             out("  ...（更早 %d 步见 tg show）" % (len(done) - 4))
-    doing = next((s for s in plan["steps"] if s["status"] == "doing"), None)
-    nxt = doing or next((s for s in plan["steps"]
-                         if s["status"] == "todo" and _deps_done(plan, s)[0]), None)
+    doing = [s for s in plan["steps"] if s["status"] == "doing"]
+    if len(doing) > 1:
+        out("在跑: %d 步并发 —— %s"
+            % (len(doing), "、".join("#%d %s" % (s["n"], s["title"])
+                                     for s in doing)))
+        for s in doing:
+            out("  #%d 产物: %s · 验收 %d 条（点名验：tg gate %d）"
+                % (s["n"], s.get("out", "-"), len(s.get("accept") or []), s["n"]))
+        # 不挑一个装成「继续这个」：多路并发时「下一步」本来就不是单值。
+        nxt = None
+    else:
+        nxt = (doing[0] if doing else None) or next(
+            (s for s in plan["steps"]
+             if s["status"] == "todo" and _deps_done(plan, s)[0]), None)
     if nxt:
         out("继续: #%d %s (tier=%s, 预算 %s, 第 %d 轮)"
             % (nxt["n"], nxt["title"], nxt["tier"],
@@ -1244,6 +1302,9 @@ def cmd_resume(a):
         out("禁读: %s" % "、".join(plan["exclude"]))
     if nxt:
         out("先跑 tg gate %d 确认当前状态，再动手。" % nxt["n"])
+    elif len(doing) > 1:
+        out("先逐个点名验：%s。多路并发时没有「下一步」这个单值。"
+            % "、".join("tg gate %d" % s["n"] for s in doing))
     else:
         out("全部步骤已完成。跑 tg reconcile 做收尾核验。")
 
@@ -2210,15 +2271,14 @@ def ctx_report(root, sid=None):
                 "把会变的东西（时间戳、随机数、未排序的目录列举）挪到提示末尾"
                 % (hit * 100.0, CACHE_HEALTH * 100.0))
 
-    # ---- 判断四：轮数预算
-    doing = next((s for s in plan["steps"] if s["status"] == "doing"), None)
-    if doing is not None:
-        reqs = reqs_for(ledger, doing["n"])
-        br = doing.get("budget_rounds", 0)
+    # ---- 判断四：轮数预算（多路并发时每一步都要查，不能只看第一步）----
+    for d in [s for s in plan["steps"] if s["status"] == "doing"]:
+        reqs = reqs_for(ledger, d["n"])
+        br = d.get("budget_rounds", 0)
         if br and reqs > br:
             rep["verdict"].append(
                 "第 %d 步已用 %d 轮，超过预算 %d 轮：这是轮数问题，不是压缩问题——"
-                "拆步骤或 handoff，别再压输入" % (doing["n"], reqs, br))
+                "拆步骤或 handoff，别再压输入" % (d["n"], reqs, br))
 
     # ---- 两种省钱手段的比价
     if price and est:
@@ -2644,7 +2704,15 @@ def cmd_sync(a):
     if a.step is not None:
         s = step_by_n(plan, a.step)
     else:
-        s = next((x for x in plan["steps"] if x.get("status") == "doing"), None)
+        doing = [x for x in plan["steps"] if x.get("status") == "doing"]
+        if len(doing) > 1:
+            # 归属错了比不记更坏：宁可不记账，也不把两路的钱混到一步上。
+            die("现在有 %d 步同时在 doing（%s），用量无处可归 —— 归错比不记更糟。\n"
+                "    多路并发时每路一个会话，按会话点名归账：\n      %s"
+                % (len(doing), "、".join("#%d" % x["n"] for x in doing),
+                   "\n      ".join("tg sync --step %d --session <第 %d 路的会话 id>"
+                                  % (x["n"], x["n"]) for x in doing)))
+        s = doing[0] if doing else None
         if s is None:
             die("当前没有 doing 的步骤，用量无处可归。先 tg start N，"
                 "或者显式指定：tg sync --step N")
@@ -3082,6 +3150,8 @@ def main():
     p = sub.add_parser("start", help="开始某一步")
     p.add_argument("n", type=int)
     p.add_argument("--force", action="store_true", help="跳过的依赖检查")
+    p.add_argument("--max-fanout", type=int, default=None, metavar="N",
+                   help="允许几步同时在 doing（默认 %d 路）。多路并发要独立会话" % MAX_FANOUT)
     p.set_defaults(fn=cmd_start)
 
     p = sub.add_parser("reset", help="把某一步退回 todo")

@@ -648,6 +648,43 @@ def main():
         expect("started_ms" not in json.load(fh)["steps"][0],
                "reset 清掉边界：重新开始 = 重新计")
 
+    # ---------- C1：两步同时在 doing 时，归账不许猜 ----------
+    print("\n== C1 多路并发不猜归属 ==")
+    tmpc = tempfile.mkdtemp(prefix="tgsync_")
+    make_config(os.path.join(tmpc, "opencode.json"))
+    run(tmpc, ["init", "并发归账"])
+    run(tmpc, ["add", "--title", "A", "--out", "a/"])
+    run(tmpc, ["add", "--title", "B", "--out", "b/"])
+    run(tmpc, ["start", "1"])
+    rc2 = run(tmpc, ["start", "2"])
+    expect(rc2.returncode == 0, "两路可以同时在 doing（≤ max-fanout）")
+    t0c = now_ms()
+    make_db(os.path.join(tmpc, "fake.db"), TURNS3, t0=t0c)
+    pjc = os.path.join(tmpc, ".plan", "plan.json")
+    with open(pjc, encoding="utf-8") as fh:
+        pj_c = json.load(fh)
+    for st in pj_c["steps"]:
+        st["started_ms"] = t0c - (len(TURNS3) + 1) * 1000
+    pj_c["created"] = iso_ms(t0c - (len(TURNS3) + 2) * 1000)
+    with open(pjc, "w", encoding="utf-8") as fh:
+        json.dump(pj_c, fh, ensure_ascii=False)
+
+    r = run(tmpc, ["sync"])
+    expect(r.returncode != 0, "两步 doing 时 sync 不点名就拒（归错比不记更糟）")
+    expect("归错比不记更糟" in (r.stderr or ""), "拒的时候说清为什么不猜")
+    expect((r.stderr or "").count("tg sync --step") == 2,
+           "拒的时候给出每路一条点名归账命令")
+    expect(ledger(tmpc) == [], "拒的时候账本一个字都不许写（宁可不记）")
+    expect(not os.path.isfile(os.path.join(tmpc, ".plan", "sync.json"))
+           or not sync_state(tmpc)["sessions"],
+           "拒的时候游标也不许动")
+
+    d = run_json(tmpc, ["sync", "--step", "2"])
+    expect(d is not None and d["step"] == 2, "点名了才记账，且记到点名的那一步")
+    expect(d is not None and d["fresh"] == 3,
+           "点名的这一路仍认全部 3 轮（边界是这个会话自己的）")
+    expect(len(ledger(tmpc)) == 1, "只写了一笔，没把两路的钱混在一起")
+
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:
         print("  - " + m)

@@ -358,6 +358,57 @@ def main():
     check("gate --json 单条 check 带 timeout=true",
           any(c.get("timeout") for c in d.get("checks", [])), repr(d.get("checks")))
 
+    # ---------------- C1：doing 可以是多值，但受 --max-fanout 约束 ----------------
+    # 这是 A 阶段实测出来的真缺口：两路并发时第二路只能绕过 start、收工直接
+    # `sync --step N --session <id>`，那一路就没有 started_ms，归账边界退化成
+    # 计划 created。与其让人绕，不如把上限明说出来，并让「不点名就猜」的命令全部闭嘴。
+    fan3 = tempfile.mkdtemp(prefix="plfan_")
+    subprocess.run("git init -q", cwd=fan3, shell=True, capture_output=True)
+    run(["init", "并发"], fan3)
+    for t, o in (("A 后端", "api/"), ("B 前端", "web/"), ("C 测试", "tests/")):
+        run(["add", "--title", t, "--out", o,
+             "--accept", "file:exists:%sx.txt" % o], fan3)
+
+    r = run(["start", "1"], fan3)
+    check("第 1 路 start 正常", r.returncode == 0, r.stderr[:120])
+    r = run(["start", "2"], fan3)
+    check("第 2 路 start 放行（2 路 = 默认上限）", r.returncode == 0, r.stderr[:120])
+    check("放行时提醒每路要独立会话、按会话归账",
+          "独立会话" in (r.stdout or "") + (r.stderr or ""))
+    r = run(["start", "3"], fan3, expect=2)
+    check("第 3 路被拒（3 路 > 上限 2）", r.returncode == 2)
+    check("被拒时说是 token 不是时间（cost runaway）", "cost runaway" in r.stderr)
+    check("被拒时追问「谁看、谁合、合不上怎么办」", "谁看、谁合" in r.stderr)
+    check("被拒时给出抬高上限的具体命令", "tg start 3 --max-fanout 3" in r.stderr)
+    check("被拒时没人话跑到 stdout（错误只在 stderr）",
+          (r.stdout or "").strip() == "", repr((r.stdout or "")[:80]))
+    r = run(["start", "3", "--max-fanout", "3"], fan3)
+    check("--max-fanout 3 显式放行", r.returncode == 0, r.stderr[:120])
+
+    # 多路 doing 时，不带编号的命令不许「取第一个」——猜错等于给错的步骤发通行证
+    r = run(["gate"], fan3, expect=2)
+    check("多路 doing 时 gate 不点名就拒", r.returncode == 2)
+    check("gate 拒时把候选编号全列出来",
+          "#1" in r.stderr and "#3" in r.stderr, r.stderr[:160])
+    r = run(["gate", "--json"], fan3, expect=2)
+    d3 = json.loads(r.stdout)
+    check("gate --json 在多路 doing 时仍是纯 JSON",
+          d3.get("ok") is False and d3.get("step") is None, repr(d3)[:160])
+    check("gate --json 用 ambiguous 列出候选", d3.get("ambiguous") == [1, 2, 3],
+          repr(d3.get("ambiguous")))
+    check("gate --json 的 exit 字段与真退出码一致", d3.get("exit") == 2)
+
+    d3 = json.loads(run(["status", "--json"], fan3).stdout)
+    check("status --json 的 doing 是三项列表", d3["doing"] == [1, 2, 3],
+          repr(d3["doing"]))
+    txt = run(["status"], fan3).stdout
+    check("status 文字版把并发的步骤全列出来（不只报第一个）",
+          "3 步同时在跑" in txt and "#3" in txt, txt[:300])
+    txt = run(["resume"], fan3).stdout
+    check("resume 不挑一个装成「下一步」",
+          "没有「下一步」这个单值" in txt, txt[-200:])
+    check("resume 不谎称「全部步骤已完成」", "全部步骤已完成" not in txt)
+
     # 空分支：零步骤、零 doing 时，--json 的 stdout 也必须是一个 JSON 对象，
     # 而且「没有数据」和「数据是 0」不许混为一谈 —— totals 给 null 而不是 0，
     # 因为 0 会被读成「一分钱没花」，null 才诚实地表示「还没有计划」。

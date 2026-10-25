@@ -385,14 +385,15 @@ def cmd_fan(a):
     elif not (root / contract).is_file():
         die("契约文件不存在：%s" % contract)
 
-    # ⑤ 现状提醒：tg 的 doing 目前是单值
+    # ⑤ 现状提醒：doing 最多 DEFAULT_MAX_FANOUT 路，但每路必须是独立会话
     others_doing = [n for n in status.get("doing", []) if n != a.step]
     if others_doing or len(roles) > 1:
-        warn("tg 的 `doing` 现在是单值（tg start 会拒绝第二个）。所以两路并发时：\n"
-             "    第一路正常 tg start <n> 拿归账边界；其余各路直接\n"
-             "    tg sync --step <n> --session <sid>（每个 subagent 一个独立会话，\n"
-             "    游标按会话分开，归属仍然是干净的）。这是绕过，不是支持 ——\n"
-             "    doing 放宽成受 max_fanout 约束的多值已经排进内核改动。")
+        warn("并发的前提是**每路一个独立会话**。tg 允许最多 %d 步同时 doing"
+             "（默认 2 路，第 3 路要 tg start N --max-fanout 3）：\n"
+             "    每路各开一个 subagent 会话 → 在**自己的会话里** tg start <n> 拿归账边界\n"
+             "    → 收工 tg gate <n> 点名验、tg sync --step <n> --session <sid> 点名归账。\n"
+             "    两路塞进同一个会话是最坏的情况：轮次混在一起，点谁的名都是猜。"
+             % DEFAULT_MAX_FANOUT)
 
     # ⑥ 生成简报
     bdir = orch_dir(root) / "briefs"
