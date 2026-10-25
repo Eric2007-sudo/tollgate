@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -329,6 +330,31 @@ def main():
     expect(d2 is not None and d2.get("fresh") == 0,
            "重建后 sync 不重记已入账的轮次（实际 %s）" % (d2 or {}).get("fresh"))
     expect(ledger(tmp13) == [], "新账本没有被旧轮次污染")
+
+    # ---------- 17. 同期还有别的会话在花钱：账本只是下限，必须说出来 ----------
+    # sync 一次只认一个会话。同期的子 agent / 另一个窗口的花费不在账本里，
+    # 分摊账单时这个下限很实在 —— 所以 sync 要给一句提示，而不是让用户自己发现。
+    tmp14 = case("17 别的会话也在花钱", TURNS3)
+    con = sqlite3.connect(os.path.join(tmp14, "fake.db"))
+    later_ms = int(time.time() * 1000) + 1000
+    con.execute(
+        "insert into session_v2 values (?,?,?,?,?,?,?,?,?,?)",
+        ("ses_other", json.dumps({"id": "deepseek-v4.1-flash",
+                                  "providerID": "kouxian"}),
+         0.005, 40000, 900, 100, 50000, 0, 1, later_ms))
+    con.commit()
+    con.close()
+    d3 = run_json(tmp14, ["sync"])
+    others = (d3 or {}).get("others") or {}
+    expect(others.get("count") == 1,
+           "报出 1 个同期会话（实际 %s）" % others.get("count"))
+    expect(abs((others.get("usd") or 0) - 0.005) < 1e-12,
+           "并报出它的花费 0.005（实际 %s）" % others.get("usd"))
+    expect(others.get("sessions") == ["ses_other"], "会话 id 也在里面")
+    r = run(tmp14, ["sync"])          # 第二次：没有新轮次，但这句提示不能消失
+    body = r.stdout + r.stderr
+    expect("不在这个账本里" in body, "没有新轮次时也提醒别的会话没入账")
+    expect("sync 一次只认一个会话" in body, "并说明原因")
 
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:

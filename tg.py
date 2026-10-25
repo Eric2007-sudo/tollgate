@@ -131,7 +131,9 @@ def load(root):
     p = paths(root)
     if not p["json"].is_file():
         die('没有找到 .plan/plan.json。先运行：tg init "你的目标"')
-    with open(p["json"], encoding="utf-8") as fh:
+    # utf-8-sig：Windows 上的编辑器（PowerShell 的 Set-Content、记事本、VS Code 另存）
+    # 很容易给 plan.json 加上 BOM。加了 BOM 还是同一份计划，不该让整个 CLI 崩掉。
+    with open(p["json"], encoding="utf-8-sig") as fh:
         plan = json.load(fh)
     # 兼容 v1 计划文件
     plan.setdefault("exclude", [])
@@ -156,7 +158,9 @@ def load_ledger(root):
     if not p["ledger"].is_file():
         return []
     rows = []
-    with open(p["ledger"], encoding="utf-8") as fh:
+    # utf-8-sig：账本可能被人工编辑过（Windows 编辑器会写 BOM）。有 BOM 只影响第一行，
+    # 而第一行丢掉等于悄悄少记一笔钱 —— 比报错更坏，所以这里也要容忍。
+    with open(p["ledger"], encoding="utf-8-sig") as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -1030,6 +1034,7 @@ def cmd_handoff(a):
     root = find_root()
     plan = load(root)
     s = step_by_n(plan, a.n)
+    ledger = load_ledger(root)
     p = paths(root)
     p["brief"].mkdir(parents=True, exist_ok=True)
 
@@ -1058,9 +1063,35 @@ def cmd_handoff(a):
     L.append("- 步骤号：#%d（共 %d 步，你是其中之一）" % (s["n"], len(plan["steps"])))
     L.append("- 复杂度档位：`%s`（cheap=机械活 / std=常规实现 / deep=需要判断）" % s["tier"])
     L.append("- token 预算：%s（%d tok）" % (fmt_k(s["budget"]), s["budget"]))
+    if s.get("budget_rounds"):
+        L.append("- 轮数上限：%d 轮 —— **预算按轮数算**，上面那个 token 数是探测器，"
+                 "不是配额" % s["budget_rounds"])
     if s.get("reuse"):
         L.append("- 复用梯子：%s —— 先确认前 6 级都不成立再写新代码"
                  % REUSE_LABEL.get(s["reuse"], s["reuse"]))
+    L.append("")
+
+    # 已经花掉多少：执行者需要知道还剩多少余地，才不会把「翻 40 个文件」当成正常操作。
+    used = reqs_for(ledger, s["n"])
+    spent = spent_for(ledger, s["n"])
+    cash, cash_rows = cost_for(ledger, s["n"])
+    L.append("## 这一步已经花了什么")
+    L.append("")
+    if used or spent or cash_rows:
+        if s.get("budget_rounds"):
+            L.append("- 轮数：%d / %d 轮" % (used, s["budget_rounds"]))
+        else:
+            L.append("- 轮数：%d 轮（这一步没设上限）" % used)
+        L.append("- 已记 token：%s" % fmt_k(spent))
+        if cash is not None:
+            L.append("- 账本里的钱：%s（宿主记录，%d 笔）" % (money(cash), cash_rows))
+        else:
+            L.append("- 账本里的钱：没有 cost 记录（跑 `tg sync` 让宿主报账）")
+    else:
+        L.append("账本里还没有这一步的记录 —— 第一次 `tg sync` 之后这里才会有数。")
+    L.append("")
+    L.append("**你在新会话里跑的轮数不会自动记进这个计划**（`tg sync` 只认当前会话）。"
+             "做完之后让发起人跑一次 `tg sync`，账本才对得上。")
     L.append("")
 
     if deps:
@@ -2051,6 +2082,49 @@ def cost_for(ledger, n=None):
     return (tot, cnt) if cnt else (None, 0)
 
 
+def plan_created_ms(plan):
+    """计划的建立时间（epoch 毫秒）。解析不了就返回 None —— 不拿假时间做比较。"""
+    raw = (plan or {}).get("created") or ""
+    try:
+        return int(time.mktime(time.strptime(raw, "%Y-%m-%dT%H:%M:%S")) * 1000)
+    except Exception:
+        return None
+
+
+def other_spenders(plan, cur_sid):
+    """同期在花钱、但**不在这个账本里**的会话。
+
+    sync 一次只认一个会话（当前那个）。同期的子 agent、另一个窗口、切回官方之前
+    那个会话，它们的花费都不会进这个账本 —— 所以账本记的钱是**下限**。分摊账单时
+    这个下限很实在，每次 sync 都把它说出来，比等用户自己发现强。
+    """
+    since = plan_created_ms(plan)
+    found = []
+    for r in read_sessions():
+        if r["session"] == cur_sid or r["cost"] <= 0:
+            continue
+        if since is not None and r["time_updated"] < since:
+            continue
+        found.append(r)
+    return found
+
+
+def others_payload(others):
+    return {
+        "count": len(others),
+        "usd": round(sum(r["cost"] for r in others), 12) if others else 0.0,
+        "sessions": [r["session"] for r in others],
+    }
+
+
+def others_line(others):
+    if not others:
+        return None
+    total = sum(r["cost"] for r in others)
+    return ("  另有 %d 个会话同期也在花钱（合计 $%.6f）—— 它们不在这个账本里："
+            "sync 一次只认一个会话。" % (len(others), total))
+
+
 def cmd_sync(a):
     """把宿主的真实用量对账进账本，替代手填 spend。"""
     root = find_root()
@@ -2081,12 +2155,17 @@ def cmd_sync(a):
     if not fresh:
         msg = "没有新轮次：会话 %s 最近 %d 轮都已入账。" % (
             row["session"][:12], len(turns))
+        others = other_spenders(plan, row["session"])
         if a.json:
             out(json.dumps({"ok": True, "fresh": 0, "turns_read": len(turns),
-                            "session": row["session"], "step": s["n"]},
+                            "session": row["session"], "step": s["n"],
+                            "others": others_payload(others)},
                            ensure_ascii=False, indent=1))
         else:
             out(msg)
+            line = others_line(others)
+            if line:
+                out(line)
         return
 
     tin = sum(t["input"] for t in fresh)
@@ -2139,6 +2218,7 @@ def cmd_sync(a):
     pct = (used / budget * 100) if budget else 0
     over_budget = bool(budget) and used > budget
     over_rounds = bool(br) and reqs > br
+    others = other_spenders(plan, row["session"])
 
     if a.json:
         out(json.dumps({
@@ -2152,6 +2232,7 @@ def cmd_sync(a):
                            "reqs": reqs, "budget_rounds": br},
             "over_budget": over_budget, "over_rounds": over_rounds,
             "truncated": truncated, "record": rec,
+            "others": others_payload(others),
         }, ensure_ascii=False, indent=1))
         return
 
@@ -2166,6 +2247,9 @@ def cmd_sync(a):
         out("  缓存读 %s / 写 %s —— 不计入预算：命中只是便宜的重读，"
             "不占新 token" % (fmt_k(tcr), fmt_k(tcw)))
     out("  钱：%s · %s" % (money(cost), cost_src))
+    line = others_line(others)
+    if line:
+        out(line)
     out("")
     out("== 这一步累计 ==")
     out("  #%d %s / %s（%.0f%%）" % (s["n"], fmt_k(used), fmt_k(budget), pct))
@@ -2241,6 +2325,12 @@ def state_payload(root):
         "same_session": bool(sid) and state["session"] == sid,
         "pending_in_window": pending,
     }
+
+    # 同期在别处花的钱：账本只记一个会话，所以看板上的钱也是**下限**。
+    # 只对「计划建立之后」的会话计数 —— 计划之前跑的花费跟这件事无关，报出来是噪音。
+    others = other_spenders(plan, sid) if plan.get("created") else []
+    money["other_sessions"] = len(others)
+    money["other_usd"] = round(sum(r["cost"] for r in others), 12) if others else None
 
     return {
         "goal": plan.get("goal", ""),

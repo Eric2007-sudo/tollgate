@@ -66,7 +66,8 @@ def main():
         for k in ("money", "sync"):
             expect(k in state, "/api/state 含字段 %s" % k)
         money = state.get("money") or {}
-        for k in ("ledger_usd", "rows", "rounds", "per_round_usd", "host_usd"):
+        for k in ("ledger_usd", "rows", "rounds", "per_round_usd", "host_usd",
+                  "other_sessions", "other_usd"):
             expect(k in money, "/api/state.money 含 %s" % k)
         syncing = state.get("sync") or {}
         for k in ("session", "synced_ids", "updated", "same_session",
@@ -79,6 +80,7 @@ def main():
         js = js.decode("utf-8", "replace")
         expect("pending_in_window" in js, "前端用上了对账状态字段")
         expect("账本花费" in js, "前端有「账本花费」卡片")
+        expect("同期在花" in js, "前端有「同期在花」提示（账本只是下限）")
 
         for path, ctype in (("/", "text/html"), ("/app.js", "javascript"),
                             ("/style.css", "text/css")):

@@ -183,6 +183,32 @@ def main():
     check("drift 报出缺 baseline", "baseline_context" in (r.stdout or ""))
     check("drift 报出缺轮数", "没有轮数" in (r.stdout or ""))
 
+    # ---------------- plan.json 被 Windows 编辑器加了 BOM 也要能读 ----------------
+    # PowerShell 的 Set-Content、记事本、VS Code 另存都可能写 BOM。加了 BOM 还是同一份
+    # 计划，不该让整个 CLI 崩掉 —— 这条在真实使用里踩到过。
+    pj = os.path.join(root, ".plan", "plan.json")
+    with open(pj, encoding="utf-8-sig") as fh:
+        raw = fh.read()
+    with open(pj, "w", encoding="utf-8-sig") as fh:      # 这个 encoding 会写 BOM
+        fh.write(raw)
+    check("测试确实写出了 BOM", open(pj, "rb").read(3) == b"\xef\xbb\xbf")
+    r = run(["status"], root, expect=0)
+    check("plan.json 带 BOM 时 status 不崩", r.returncode == 0)
+    r = run(["report"], root, expect=0)
+    check("plan.json 带 BOM 时 report 也正常", r.returncode == 0)
+
+    # ---------------- handoff 简报带上轮数上限与「已经花了什么」 ----------------
+    r = run(["handoff", "1"], root, expect=0)
+    briefs = sorted(os.listdir(os.path.join(root, ".plan", "brief")))
+    check("handoff 生成了简报文件", len(briefs) == 1, repr(briefs))
+    body = open(os.path.join(root, ".plan", "brief", briefs[0]), encoding="utf-8").read() \
+        if briefs else ""
+    check("简报里有轮数上限", "轮数上限：2 轮" in body)
+    check("简报里有「已经花了什么」", "## 这一步已经花了什么" in body)
+    check("简报报出已用轮数", "轮数：2 / 2 轮" in body)
+    check("简报没 cost 时指路 sync", "没有 cost 记录" in body)
+    check("简报明说新会话的轮数不会自动记账", "不会自动记进这个计划" in body)
+
     # ---------------- 收尾：reconcile 仍可用 ----------------
     r = run(["reconcile"], root, expect=0)
     check("reconcile 可用", r.returncode == 0)

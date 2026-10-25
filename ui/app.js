@@ -80,6 +80,10 @@ function renderCards(s) {
   } else {
     box.appendChild(card("账本花费", "没有", "跑 tg sync 让宿主报账"));
   }
+  if (m.other_sessions) {
+    box.appendChild(card("同期在花", cash(m.other_usd),
+      m.other_sessions + " 个会话不在账本里 · sync 一次只认一个会话"));
+  }
 
   if (turn && turn.ctx_tokens) {
     box.appendChild(card("本轮上下文", fmtK(turn.ctx_tokens),
