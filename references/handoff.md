@@ -159,6 +159,7 @@ tg handoff 2    # → .plan/brief/02-xxx.md
 tg handoff 3    # → .plan/brief/03-xxx.md
 
 # ── 收尾 ────────────────────────────────────
+tg sync         # 把宿主真实跑掉的轮次与钱记进账本（每步 done 之前也该跑一次）
 tg reconcile    # 所有 done 的断言再跑一遍
 tg report       # 看钱花在哪个档位、复用率多少
 ```

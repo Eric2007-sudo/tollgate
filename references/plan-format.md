@@ -1,6 +1,6 @@
 # 计划文件格式
 
-## 五个位置，一份真相
+## 一份真相，几个伴生文件
 
 ```
 .plan/
@@ -286,7 +286,7 @@ tg status
 | 情况 | 处理 |
 |---|---|
 | 全部 done | `tg drift` 做收尾检查，然后留着当记录（或归档到 `notes/`） |
-| 目标变了 | `tg amend 0 --goal "新目标"`；整个推倒重来才用 `init "新目标" --force`（会清空 ledger） |
+| 目标变了 | `tg amend 0 --goal "新目标"`；整个推倒重来才用 `init "新目标" --force`（只清 `ledger.jsonl` 与 `gates.log`，`sync.json` 留着） |
 | 只想改一个步骤 | `tg amend N ...`（留痕）。手改 `plan.json` 也行，但改动不进 ledger |
 | 中途发现步骤拆错了 | `tg reset N` 退回 todo，`tg amend N` 改契约，`tg add` 补新步骤 |
 | 计划废弃 | 删 `.plan/` 整个目录 |
