@@ -33,7 +33,7 @@
 |---|---|---|---|
 | `.plan/plan.json` | `init` / `add` / `amend` | 全部命令、看板 | **唯一的计划真相** |
 | `.plan/ledger.jsonl` | `spend` / `sync` / `gate` / `done` / `reset` | `report` / 看板 | 只追加的审计流水 |
-| `.plan/sync.json` | `sync` | `sync` 自己 | 对账游标：已入账的消息 id |
+| `.plan/sync.json` | `sync` | `sync` 自己、看板 | 对账游标：**每个会话各一份**已入账的消息 id（schema v2） |
 | `opencode.db` | 宿主（OpenCode）自己 | `ctx` / `price` / `sync` / 看板 | 真实 token 与钱，**只读** |
 
 关键约束：**tollgate 从不写宿主的库**。`opencode.db` 用 `file:<path>?mode=ro` 打开，避免和正在跑的会话抢锁。反过来，宿主也从不知道 tollgate 的存在——这是"能随时卸载"的前提。
@@ -52,7 +52,7 @@
 | **价格与账本** | `opencode_config` / `load_prices` / `opencode_db` / `read_sessions` / `current_session` / `cost_usd` |
 | **逐轮数据** | `read_turns`（解析消息里的 `tokens`）/ `growth_rate`（中位数增速） |
 | **上下文报告** | `ctx_report`（唯一的口径聚合点）/ `cmd_ctx` / `cmd_price` |
-| **两闸交界** | `load_sync` / `save_sync`（游标）/ `cmd_sync`（把逐轮用量写进账本） |
+| **两闸交界** | `load_cursors` / `save_cursors`（按会话分开的游标，v1 读时自动升级）/ `cmd_sync`（把逐轮用量写进账本） |
 | **工作台** | `state_payload`（把上面全部打包成 JSON）/ `_make_handler` / `cmd_serve` |
 | 入口 | argparse，25 个子命令 |
 
@@ -93,7 +93,8 @@ current_session()          挑会话：--session > $OPENCODE_SESSION_ID > 最近
 ```
 current_session()            挑会话（同 ctx）
       │
-      ├── load_sync()        读 .plan/sync.json 里的已入账 id 集合
+      ├── load_cursors()    读 .plan/sync.json：**这个会话**已入账的 id 集合
+      │                     （别的会话的游标原样留着，不动）
       │
       ├── read_turns(sid)    最新 2000 轮，逐轮 tokens + cost
       │        │
@@ -105,7 +106,7 @@ current_session()            挑会话（同 ctx）
       │                 └── cost= Σ cost   （为 0 时按 load_prices 重算，标 cost_est）
       │
       ├── append_ledger()    写一笔 {step, in, out, reqs, cache_read, cost, src}
-      └── save_sync()        游标前移，上限 2000 条
+      └── save_cursors()     这个会话的游标前移（上限 2000 条），其它会话不动
 ```
 
 三个设计决定：
@@ -116,6 +117,9 @@ current_session()            挑会话（同 ctx）
    "认得的都在读窗口里"，于是既不重复记账、也不会因为游标比窗口窄而反复重记。
 3. **归账宁可拒绝**：没有 `doing` 的步骤时直接非 0 退出，而不是猜一个步骤记上去。
    记到错的地方比不记更坏——账本的价值全在可信。
+4. **游标按会话分开**：一次 `sync` 只处理一个会话，但每个会话各留一份已入账 id。
+   曾经只有一份扁平游标、换会话就清空，于是 A→B→A 会把 A 整段重记（实测 4 轮 /
+   $0.0011 记成 7 轮 / $0.0014）。会话是几根并行的计数器，不是一根。
 
 ## 工作台为什么是静态页
 
@@ -134,17 +138,15 @@ current_session()            挑会话（同 ctx）
 | 块 | 内容 | 诚实处理 |
 |---|---|---|
 | `money` | 账本里真实记过的 `cost` 求和、笔数、轮数、单轮均价、宿主累计、**同期别的会话花了多少**（`other_sessions` / `other_usd`） | 一笔 cost 都没有时 `ledger_usd = null`，前端显示「没有」并指路 `tg sync`；没有别的会话时 `other_usd = null`，卡片不出现 |
-| `sync` | 游标所属会话、已入账 id 数、上次对账时间、窗口内未入账轮数 | 未入账数只算**手上这 40 轮窗口**——窗口外的东西看板也不该假装知道 |
+| `sync` | **正在看的那个会话**的游标状态（`synced_ids` / `same_session` / `updated`，`last_session` 是最后一次 sync 的会话）、账本里一共记过几个会话（`sessions`）、窗口内未入账轮数 | 未入账数只算**手上这 40 轮窗口**，而且只跟**这个会话**的游标比——拿别的会话的游标比会直接算错 |
 
 `money` 是**快照**：账本记的是上次 `sync` 那一刻的数，宿主累计一直在涨。两者差值 ≈ 上次对账
 之后又跑掉的钱，界面把"截至上次 sync"写在卡片上，避免被当成实时值。
 
 `other_usd` 是**下限的另一半**：`sync` 一次只认一个会话，所以账本里的钱是花费下限。计划建立
 之后仍在花钱的别的会话（子 agent、另一个窗口）单独列一张「同期在花」卡片——它不进账本，
-但看板上不能假装它不存在。计划之前跑过的会话不计入，那跟这件事无关。
-
-代价：`state_payload()` 每轮多调一次 `read_turns(sid, limit=CTX_WINDOW)`（40 行）来算
-`pending_in_window`。数据量小，3 秒一次完全够；如果哪天宿主库变得很大，这里是第一个该加缓存的地方。
+但看板上不能假装它不存在。计划之前跑过的会话不计入，那跟这件事无关。要把它们补进账本，
+逐个 `tg sync --session <id>` 就行：游标按会话分开存，来回切多少次都只记一次。
 
 代价：`state_payload()` 每轮多调一次 `read_turns(sid, limit=CTX_WINDOW)`（40 行）来算
 `pending_in_window`。数据量小，3 秒一次完全够；如果哪天宿主库变得很大，这里是第一个该加缓存的地方。

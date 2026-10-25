@@ -33,6 +33,15 @@ tollgate 0.2 新增：
                           （in 只算新输入，out 含推理，cache_read 单列不入预算），
                           游标存在 .plan/sync.json，同一轮永远不会重复记账。
 
+tollgate 0.3 新增：
+  游标按会话分开存            sync.json v2：sessions{会话id: 已入账 id + 时间}。
+                             曾经只有一份扁平游标、换会话就清空 → A→B→A 把 A 整段
+                             重记（实测应有 4 轮/$0.0011，记成 7 轮/$0.0014）。
+                             老 v1 文件读时自动升级，不用手动迁移。
+  sync --session <id>         把另一个会话（子 agent / 另一个窗口）也归账；配合同期提示，
+                             下限可以补成接近真实总数，而且补多少次都不翻倍。
+  看板同步游标口径             对账行按「正在看的这个会话」的游标算，不再拿别的会话的比。
+
 四条不变的设计约束：
   1. 零依赖      只用标准库，Windows / macOS / Linux 同一份代码
   2. 单一真相    .plan/plan.json 是唯一真源，plan.md 只是渲染视图
@@ -2026,6 +2035,10 @@ def cmd_price(a):
 
 SYNC_KEEP = 2000
 
+# 每个会话各留一份游标，最多记这么多个会话。上限存在的理由：sync.json 要小到人能读懂、
+# git diff 能看懂；超了按「最近同步」淘汰最久没动过的。
+SYNC_SESSIONS = 32
+
 # 读窗口和游标窗口必须是同一个数：游标记住的就是读窗口里的那些 id。窗口对齐
 # 才能保证「读到的轮次全都认得、认得的都在读窗口里」，既不重复记账，也不会因为
 # 游标比窗口窄而反复重记。窗口之外更早的轮次（只有长得离谱的会话才会遇到）第一
@@ -2036,9 +2049,15 @@ def sync_path(root):
     return paths(root)["dir"] / "sync.json"
 
 
-def load_sync(root):
-    """读取同步游标：已入账的消息 id 集合。空/坏文件一律当「从没同步过」。"""
-    blank = {"session": "", "ids": [], "updated": ""}
+def load_cursors(root):
+    """读对账游标：{"sessions": {会话id: {"ids": [...], "updated": iso}}, "last": 会话id}
+
+    为什么**按会话分开**：以前只有一份扁平游标，换会话就清空。于是「对 A 记完 → 去 B
+    记一遍 → 再回来对 A」会把 A 整个重记一遍：实测三重切换就让账本从应有的 4 轮 /
+    $0.0008 变成 7 轮 / $0.0014（A 的 3 轮被算了两遍）。会话不是一根计数器，是几根
+    并行的计数器。空/坏文件一律当「从没同步过」。
+    """
+    blank = {"sessions": {}, "last": ""}
     p = sync_path(root)
     if not p.is_file():
         return blank
@@ -2048,22 +2067,54 @@ def load_sync(root):
         return blank
     if not isinstance(d, dict):
         return blank
-    ids = d.get("ids")
-    return {
-        "session": str(d.get("session") or ""),
-        "ids": [str(x) for x in ids] if isinstance(ids, list) else [],
-        "updated": str(d.get("updated") or ""),
-    }
+    found = {}
+    raw = d.get("sessions")
+    if isinstance(raw, dict):
+        for sid, v in raw.items():
+            if isinstance(v, dict):
+                ids = v.get("ids")
+                found[str(sid)] = {
+                    "ids": [str(x) for x in ids] if isinstance(ids, list) else [],
+                    "updated": str(v.get("updated") or ""),
+                }
+            elif isinstance(v, list):
+                # 手写过的中间形态：会话 id 直接对一串 id，没有时间戳
+                found[str(sid)] = {"ids": [str(x) for x in v], "updated": ""}
+    if not found:
+        # v1 升级：老文件只有顶层 session + ids。不动文件，读的时候升上来。
+        sid = str(d.get("session") or "")
+        ids = d.get("ids")
+        if sid and isinstance(ids, list):
+            found[sid] = {"ids": [str(x) for x in ids],
+                          "updated": str(d.get("updated") or "")}
+    last = str(d.get("session") or "")
+    if not last and found:
+        last = list(found)[-1]
+    return {"sessions": found, "last": last}
 
 
-def save_sync(root, data):
-    p = sync_path(root)
-    p.parent.mkdir(parents=True, exist_ok=True)
+def save_cursors(root, cur, last):
+    """写回：每个会话只留最近 SYNC_KEEP 条 id；会话数超上限就淘汰最久没动过的。"""
+    trimmed = {}
+    for sid, v in (cur.get("sessions") or {}).items():
+        ids = (v.get("ids") or [])[-SYNC_KEEP:]
+        if not ids:
+            continue
+        trimmed[sid] = {"ids": ids, "updated": v.get("updated") or ""}
+    if len(trimmed) > SYNC_SESSIONS:
+        ordered = sorted(trimmed.items(), key=lambda kv: kv[1]["updated"], reverse=True)
+        trimmed = dict(ordered[:SYNC_SESSIONS])
+        if last not in trimmed:
+            last = ordered[0][0]
     payload = {
-        "session": data.get("session", ""),
-        "ids": (data.get("ids") or [])[-SYNC_KEEP:],
+        "version": 2,
+        "sessions": trimmed,
+        "session": last,                              # 兼容 v1 读法：最后一次同步的会话
+        "ids": (trimmed.get(last) or {}).get("ids") or [],
         "updated": now_iso(),
     }
+    p = sync_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1)
 
@@ -2123,8 +2174,9 @@ def others_line(others):
     if not others:
         return None
     total = sum(r["cost"] for r in others)
-    return ("  另有 %d 个会话同期也在花钱（合计 $%.6f）—— 它们不在这个账本里："
-            "sync 一次只认一个会话。" % (len(others), total))
+    return ("  另有 %d 个会话同期也在花钱（合计 $%.6f）—— 它们还没入账：要入账就逐个"
+            " tg sync --session <id>（每个会话各有游标，来回切不会重记）。"
+            % (len(others), total))
 
 
 def cmd_sync(a):
@@ -2147,11 +2199,10 @@ def cmd_sync(a):
 
     turns = read_turns(row["session"], limit=SYNC_KEEP)
     truncated = len(turns) >= SYNC_KEEP
-    state = load_sync(root)
-    if state["session"] != row["session"]:
-        # 换了会话就从零算：上一个会话的 id 与这个会话无关
-        state = {"session": row["session"], "ids": []}
-    seen = set(state["ids"])
+    # 游标按会话分开存：第一次同步某个会话时它当然是全新的，但**回来的时候不会重记**。
+    cur = load_cursors(root)
+    mine = (cur["sessions"].get(row["session"]) or {}).get("ids") or []
+    seen = set(mine)
     fresh = [t for t in turns if t["id"] not in seen]
 
     if not fresh:
@@ -2208,9 +2259,11 @@ def cmd_sync(a):
         ledger_after = load_ledger(root) + [rec]
     else:
         append_ledger(root, rec)
-        state["ids"] = (state["ids"] or []) + [t["id"] for t in fresh]
-        state["session"] = row["session"]
-        save_sync(root, state)
+        cur["sessions"][row["session"]] = {
+            "ids": mine + [t["id"] for t in fresh],
+            "updated": now_iso(),
+        }
+        save_cursors(root, cur, last=row["session"])
         ledger_after = load_ledger(root)
 
     used = spent_for(ledger_after, s["n"])
@@ -2234,12 +2287,16 @@ def cmd_sync(a):
                            "reqs": reqs, "budget_rounds": br},
             "over_budget": over_budget, "over_rounds": over_rounds,
             "truncated": truncated, "record": rec,
+            "cursor": {"session_ids": len(mine) + len(fresh),
+                       "sessions": len(cur["sessions"]) or 1},
             "others": others_payload(others),
         }, ensure_ascii=False, indent=1))
         return
 
     out("== 对账（源：opencode.db） ==")
     out("  会话 %s ｜ 本次同步 %d 轮（上次 sync 之后）" % (row["session"][:12], len(fresh)))
+    out("  这个会话已入账 %d 条轮次；账本里共有 %d 个会话的游标"
+        % (len(mine) + len(fresh), len(cur["sessions"]) or 1))
     if truncated:
         out("  只读到最近 %d 轮 —— 更早的轮次读不到，也就不会计入。这时的 tok 数"
             "不等于「会话总共跑了多少」，那看 tg ctx。" % SYNC_KEEP)
@@ -2313,18 +2370,23 @@ def state_payload(root):
     }
 
     # 对账状态：只看手上这 40 轮窗口里还有几轮没入账 —— 窗口外的东西看板也不该假装知道。
-    state = load_sync(root)
+    # 游标按会话分开存，所以这里要拿**正在看的那个会话**的游标比；拿别的会话的游标比，
+    # 「还有几轮没入账」会直接算错。
+    cur = load_cursors(root)
     sid = (rep.get("session") or {}).get("session") or ""
-    seen = set(state["ids"])
+    mine = ((cur["sessions"].get(sid) or {}).get("ids") or []) if sid else []
+    seen = set(mine)
     pending = None
     if sid:
         pending = sum(1 for t in read_turns(sid, limit=CTX_WINDOW)
                       if t["id"] not in seen)
     syncing = {
-        "session": state["session"],
-        "synced_ids": len(state["ids"]),
-        "updated": state.get("updated", ""),
-        "same_session": bool(sid) and state["session"] == sid,
+        "session": sid or cur["last"],
+        "last_session": cur["last"],
+        "synced_ids": len(mine),
+        "sessions": len(cur["sessions"]),
+        "updated": ((cur["sessions"].get(sid) or {}).get("updated") or "") if sid else "",
+        "same_session": bool(sid) and bool(mine),
         "pending_in_window": pending,
     }
 
@@ -2458,7 +2520,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="tg", description="tollgate：agent 的过闸 —— 计划预算 · 上下文预算 · 本地账本")
     ap.add_argument("-V", "--version", action="version",
-                    version="tollgate 0.2（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
+                    version="tollgate 0.3（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="建立 .plan/")

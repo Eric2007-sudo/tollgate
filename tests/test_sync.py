@@ -79,6 +79,28 @@ def make_db(path, turns, sid="ses_test", model=MODEL):
     con.close()
 
 
+def add_session(path, sid, turns, prefix="msgB"):
+    """往同一个库里再塞一个会话。make_db 会删库，所以测多会话得自己加。"""
+    con = sqlite3.connect(path)
+    con.execute(
+        "insert into session_v2 values (?,?,?,?,?,?,?,?,?,?)",
+        (sid, json.dumps({"id": MODEL[1], "providerID": MODEL[0]}),
+         sum(t[4] for t in turns), sum(t[0] for t in turns),
+         sum(t[2] for t in turns), sum(t[3] for t in turns),
+         sum(t[1] for t in turns), 0, 2000, 2000))
+    for i, (tin, tcr, tout, trea, cost) in enumerate(turns):
+        data = {"model": {"id": MODEL[1], "providerID": MODEL[0]},
+                "tokens": {"input": tin, "output": tout, "reasoning": trea,
+                           "cache": {"read": tcr, "write": 0}},
+                "cost": cost}
+        con.execute(
+            "insert into session_message values (?,?,?,?,?,?,?)",
+            ("%s_%03d" % (prefix, i), sid, "assistant", i, 200 + i, 200 + i,
+             json.dumps(data)))
+    con.commit()
+    con.close()
+
+
 def run(tmp, args, sid="ses_test"):
     env = dict(os.environ)
     env["TOLLGATE_DB"] = os.path.join(tmp, "fake.db")
@@ -268,6 +290,8 @@ def main():
     expect(d is not None and d["fresh"] == 2, "新会话的 2 轮照记（实际 %s）"
            % (d or {}).get("fresh"))
     expect(sync_state(tmp7).get("session") == "ses_other", "游标跟着换到新会话")
+    expect(((d or {}).get("cursor") or {}).get("sessions") == 2,
+           "换会话时旧会话的游标也留着（各记各的，回来不重记）")
 
     # ---------- 11. report 里能看见真实钱，而不是只有 token ----------
     tmp8 = case("11 report 显示真实账", TURNS3)
@@ -332,8 +356,8 @@ def main():
     expect(ledger(tmp13) == [], "新账本没有被旧轮次污染")
 
     # ---------- 17. 同期还有别的会话在花钱：账本只是下限，必须说出来 ----------
-    # sync 一次只认一个会话。同期的子 agent / 另一个窗口的花费不在账本里，
-    # 分摊账单时这个下限很实在 —— 所以 sync 要给一句提示，而不是让用户自己发现。
+    # 没 sync 过的会话，它的花费不在账本里。分摊账单时这个下限很实在 ——
+    # 所以 sync 要给一句提示，并指出去哪补，而不是让用户自己发现。
     tmp14 = case("17 别的会话也在花钱", TURNS3)
     con = sqlite3.connect(os.path.join(tmp14, "fake.db"))
     later_ms = int(time.time() * 1000) + 1000
@@ -353,8 +377,8 @@ def main():
     expect(others.get("sessions") == ["ses_other"], "会话 id 也在里面")
     r = run(tmp14, ["sync"])          # 第二次：没有新轮次，但这句提示不能消失
     body = r.stdout + r.stderr
-    expect("不在这个账本里" in body, "没有新轮次时也提醒别的会话没入账")
-    expect("sync 一次只认一个会话" in body, "并说明原因")
+    expect("它们还没入账" in body, "没有新轮次时也提醒别的会话没入账")
+    expect("tg sync --session" in body, "并指出去哪补（逐个会话各 sync 一次）")
 
     # 计划里读不到建立时间时，宁可不报「同期」。把全部历史会话算成同期是假数，
     # 比不报更坏 —— 这条规则要钉住，别哪天顺手改成「不知道就全算」。
@@ -369,8 +393,45 @@ def main():
            "计划没有 created 时不计同期会话（实际 %s）"
            % ((d4 or {}).get("others") or {}).get("count"))
     r = run(tmp14, ["sync"])
-    expect("不在这个账本里" not in (r.stdout + r.stderr),
+    expect("它们还没入账" not in (r.stdout + r.stderr),
            "也不打印那行提示（宁可不报，不猜）")
+
+    # ---------- 18. 交替在两个会话里对账：不许重记 ----------
+    # 这是真的会双计的路径：游标只存一份、换会话就清空，于是 A→B→A 把 A 整段重记。
+    # 实测（改之前）应有 4 轮 / $0.0011，账本记成 7 轮 / $0.0014。
+    tmp15 = case("18 交替会话不重记", TURNS3)
+    add_session(os.path.join(tmp15, "fake.db"), "ses_B",
+                [(500, 0, 50, 0, 0.0002)])
+    dA1 = run_json(tmp15, ["sync"], sid="ses_test")
+    expect((dA1 or {}).get("fresh") == 3, "会话 A 首次记 3 轮（实际 %s）"
+           % (dA1 or {}).get("fresh"))
+    dB1 = run_json(tmp15, ["sync"], sid="ses_B")
+    expect((dB1 or {}).get("fresh") == 1, "会话 B 首次记 1 轮（实际 %s）"
+           % (dB1 or {}).get("fresh"))
+    dA2 = run_json(tmp15, ["sync"], sid="ses_test")
+    expect((dA2 or {}).get("fresh") == 0, "回到 A 时一轮都不重记（实际 %s）"
+           % (dA2 or {}).get("fresh"))
+    rows15 = ledger(tmp15)
+    expect(sum(r["reqs"] for r in rows15) == 4,
+           "账本合计 4 轮（实际 %d）" % sum(r["reqs"] for r in rows15))
+    expect(abs(sum(r.get("cost") or 0 for r in rows15) - 0.0011) < 1e-9,
+           "账本合计 $0.0011（实际 %.6f）" % sum(r.get("cost") or 0 for r in rows15))
+    st15 = sync_state(tmp15)
+    expect(st15.get("version") == 2 and len(st15.get("sessions") or {}) == 2,
+           "sync.json 是 v2，两个会话各有一份游标")
+
+    # v1 游标（只有顶层 session + ids）读的时候要能升上来：老账本不该因为升级而重记
+    tmp16 = case("18b v1 游标升上来", TURNS3)
+    with open(os.path.join(tmp16, ".plan", "sync.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"session": "ses_test", "ids": ["msg_000", "msg_001"],
+                   "updated": "2026-01-01T00:00:00"}, fh)
+    d16 = run_json(tmp16, ["sync"], sid="ses_test")
+    expect((d16 or {}).get("fresh") == 1, "v1 游标里那 2 轮不重记，只补剩下的 1 轮（实际 %s）"
+           % (d16 or {}).get("fresh"))
+    st16 = sync_state(tmp16)
+    expect(st16.get("version") == 2 and len(st16.get("sessions") or {}) == 1,
+           "写完就升成 v2 形状，那个会话带着 3 条 id")
 
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:

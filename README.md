@@ -134,11 +134,15 @@ python tg.py sync --dry-run       # 只报数，不写账本、不动游标
 | `cost` | Σ 每轮真实 `cost`；宿主没记就按配置单价重算并标 `cost_est` | 有真账就用真账 |
 | `cache_read` / `cache_write` | 单列存进记录，**不参与预算求和** | 命中只是便宜的重读，混进预算会让"该压还是该换手"判断失真 |
 
-游标存在 `.plan/sync.json`（已入账的消息 id 集合），所以：
+游标存在 `.plan/sync.json`，**每个会话各存一份**（schema v2：`sessions: {会话id: ids}`），所以：
 
 - 同一轮**永远不会重复记账**，多跑几次 `sync` 是安全的；
-- 换会话自动从零算，旧会话的游标吃不掉新会话的轮次；
+- 换会话不会吃掉别的会话的轮次，**回来也不会重记**（老的 v1 单游标文件读的时候自动升上来）；
 - 游标文件坏了就当从没同步过，从头重算，不崩。
+
+这条是踩出来的：以前只有一份游标、换会话就清空，于是「对 A 记完 → 去 B 记一遍 → 回来对 A」
+把 A 整段重记了一遍——实测应有的 4 轮 / \$0.0011 被记成 7 轮 / \$0.0014。会话不是一根计数
+器，是几根并行的计数器。
 
 三个诚实的边界：**归账只能归到"正在做"的那一步**（宿主不知道你的步骤边界，所以切步骤
 前先 `sync` 一次是你的事）；**读窗口是最新 2000 轮**，更早的读不到也就不计入，这时输出
@@ -148,11 +152,12 @@ python tg.py sync --dry-run       # 只报数，不写账本、不动游标
 
 ```text
   钱：$0.373855（¥2.5008） · 宿主记录
-  另有 4 个会话同期也在花钱（合计 $38.807691）—— 它们不在这个账本里：sync 一次只认一个会话。
+  另有 4 个会话同期也在花钱（合计 $38.807691）—— 它们还没入账：要入账就逐个 tg sync --session <id>（每个会话各有游标，来回切不会重记）。
 ```
 
 上面这行是真实输出：那 4 个会话加起来比这次对账的 $0.37 大两个数量级。要分摊账单，
-这个差不能装作不存在。
+这个差不能装作不存在。**补账不会翻倍**——逐个 `sync --session <会话id>` 就行，
+每个会话各有一份游标，来回切多少次都只记一次。
 
 记完账，`tg report` 的「钱」那一栏才有真数（`spend` 只记 token，记不到钱）；没有 `cost`
 的账本会明说"账本里没有 cost"，不会拿 token 数硬折成钱。`tg done` 也会在收尾时拉你一把：
@@ -255,9 +260,12 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 13. `ctx` 只看最近 40 轮（`CTX_WINDOW`）。会话比这长时它**不说"第 N 轮"**——那个 N 只是
     窗口大小，不是轮次序号；谎报轮次比不报更坏。
 14. `sync` 一次只认**一个**会话，所以账本里的钱是**下限**。同期在别处跑的花费（子 agent、
-    另一个窗口、切回官方那个会话）不会自己进账本；遇到同期有别的会话在花钱，`sync` 会
-    点名报出它们合计多少，但**不会**替你合并成一个总账。
-15. `plan.json` / `ledger.jsonl` 认 BOM（Windows 编辑器会加），但**只认 BOM**：手改 JSON 时
+    另一个窗口、切回官方那个会话）不会自己进账本；`sync` 会点名报出它们合计多少，但要**你**
+    决定要不要逐个 `tg sync --session <id>` 补账——它不替你判断哪个会话算这个任务的账。
+15. 游标按会话分开存（`sync.json` v2），最多记 32 个会话、每个会话最近 2000 条 id。超了就按
+    「最近同步」淘汰最久没动过的那个——被淘汰的会话下次再 `sync` 会整段重记。单个长会话的
+    游标很大：1020 条 id ≈ 39 KB。
+16. `plan.json` / `ledger.jsonl` 认 BOM（Windows 编辑器会加），但**只认 BOM**：手改 JSON 时
     结构写错、字段拼错，工具不会猜你的意思，该报错就报错。
 
 ---
@@ -271,7 +279,7 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 | `references/context-budget.md` | 计费公式、缓存命中、1.5× 换手结论、预算口径 vs 钱 |
 | `references/tiers.md` | 三档判据、模型 ID 映射、用账本里的真实单轮价验证档位是否生效 |
 | `references/handoff.md` | 简报怎么写、三种交付方式、换手与「回来」各自的钱 |
-| `references/anti-patterns.md` | 26 条真实失败模式（#20–#26 是闸二的口径坑与账本边界） |
+| `references/anti-patterns.md` | 27 条真实失败模式（#20–#27 是闸二的口径坑与账本边界） |
 
 ---
 
@@ -280,16 +288,16 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 ```bash
 python tests/test_tg.py        # 65 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
-python tests/test_sync.py      # 65 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账
+python tests/test_sync.py      # 74 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记
 python tests/smoke_serve.py    # 32 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花
 ```
 
-合计 **187 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **196 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面四个套件，核对 README 写的项目数与合计（不计入 187）
+python tests/check_doc_counts.py   # 真跑上面四个套件，核对 README 写的项目数与合计（不计入 196）
 ```
 
 ---

@@ -82,7 +82,7 @@ function renderCards(s) {
   }
   if (m.other_sessions) {
     box.appendChild(card("同期在花", cash(m.other_usd),
-      m.other_sessions + " 个会话不在账本里 · sync 一次只认一个会话"));
+      m.other_sessions + " 个会话还没入账 · 逐个 tg sync --session <id>"));
   }
 
   if (turn && turn.ctx_tokens) {
@@ -148,9 +148,19 @@ function renderCtx(s) {
     var sy = s.sync || {};
     if (sy.session) {
       var pend = sy.pending_in_window;
-      var ptxt = pend == null ? "未知"
+      var ptxt;
+      if (!sy.same_session) {
+        ptxt = "这个会话还没入账（跑 tg sync）";
+      } else {
+        ptxt = pend == null ? "未知"
               : (pend === 0 ? "已全部入账" : pend + " 轮未入账（跑 tg sync）");
-      kv("对账", (sy.same_session ? "" : "换了会话 · ") + ptxt +
+      }
+      var extra = "";
+      if (sy.same_session && sy.synced_ids) extra += " · 已入账 " + sy.synced_ids + " 条";
+      if (sy.sessions > 1) {
+        extra += " · 另有 " + (sy.sessions - (sy.same_session ? 1 : 0)) + " 个会话也入账过";
+      }
+      kv("对账", ptxt + extra +
         (sy.updated ? " · " + sy.updated.replace("T", " ").slice(0, 16) : ""));
     } else {
       kv("对账", "还没 sync 过（账本里只有手记的数）");
