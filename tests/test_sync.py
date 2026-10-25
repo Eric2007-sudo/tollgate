@@ -298,6 +298,17 @@ def main():
     expect(r.returncode == 0, "sync 之后 done 仍然过")
     expect("没有真实用量" not in (r.stdout + r.stderr), "sync 之后 done 不再提醒")
 
+    # ---------- 15. 长会话不许把「窗口大小」谎报成「第 N 轮」 ----------
+    tmp12 = tempfile.mkdtemp(prefix="tgsync_")
+    make_config(os.path.join(tmp12, "opencode.json"))
+    make_db(os.path.join(tmp12, "fake.db"),
+            [(500, 1000 * (i + 1), 50, 0, 0.0001) for i in range(45)])
+    r = run(tmp12, ["ctx"])
+    body = r.stdout + r.stderr
+    expect(r.returncode == 0, "ctx 在 45 轮的长会话上正常结束")
+    expect("第 40 轮上下文" not in body, "不再把「读到的第 40 条」谎报成「第 40 轮」")
+    expect("最近 40 轮" in body, "改成说清「这里只看最近 40 轮」")
+
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:
         print("  - " + m)

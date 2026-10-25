@@ -187,10 +187,10 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 
 ## 实测样本
 
-在真实长会话上跑出来的样子（40 轮、128k 窗口、中转 `deepseek-v4.1-flash`）：
+在真实长会话上跑出来的样子（128k 窗口、中转 `deepseek-v4.1-flash`）：
 
 ```
-第 40 轮上下文 74.7k tok（窗口 128k 的 58%）
+某一轮上下文 74.7k tok（窗口 128k 的 58%）
 构成 input 227 + cache_read 74.5k，本轮命中率 99.7%
 近 8 轮中位增速 +711 tok/轮 → 距窗口 90% 还有 56 轮
 这一轮 $0.000316（¥0.0021）（消息自带 cost）
@@ -232,6 +232,8 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
     别把那次结果当成"会话总共花了多少"（那看 `tg ctx` 的会话累计）。
 12. `sync` 只认带 `tokens` 的 assistant 消息。一轮里如果宿主没写 tokens，那轮就是漏记的，
     账本只保证"与宿主记到的一致"，不保证"与真金白银一致"。
+13. `ctx` 只看最近 40 轮（`CTX_WINDOW`）。会话比这长时它**不说"第 N 轮"**——那个 N 只是
+    窗口大小，不是轮次序号；谎报轮次比不报更坏。
 
 ---
 
@@ -240,11 +242,11 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 ```bash
 python tests/test_tg.py        # 53 项：计划 / 门禁 / 预算口径 / 兼容
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
-python tests/test_sync.py      # 53 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒
+python tests/test_sync.py      # 56 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报
 python tests/smoke_serve.py    # 14 项：真起服务、真打请求、Host 头校验
 ```
 
-合计 **145 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **148 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 ---
 

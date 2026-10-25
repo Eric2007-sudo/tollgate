@@ -1628,6 +1628,10 @@ def _rows_for_session(con, table, sid, limit):
         return []
 
 
+# ctx 默认只看最近这么多轮：再长也不必——判断"还能撑几轮"用不着整部历史。
+CTX_WINDOW = 40
+
+
 def read_turns(sid, limit=40):
     """按时间升序返回最近 limit 轮带 tokens 的 assistant 消息。"""
     db = opencode_db()
@@ -1725,8 +1729,11 @@ def ctx_report(root, sid=None):
         return rep
 
     window = (price or {}).get("context") or 0
-    turns = read_turns(row["session"])
+    turns = read_turns(row["session"], limit=CTX_WINDOW)
     rep["turns"] = len(turns)
+    # 窗口读满 = 会话比这个长。此时 len(turns) 只是窗口大小，不是轮次序号，
+    # 拿去当"第 N 轮"说就是谎报（这个项目最该避免的错误，见 README 局限）。
+    rep["truncated"] = len(turns) >= CTX_WINDOW
     last = turns[-1] if turns else None
 
     if last is not None:
@@ -1737,7 +1744,9 @@ def ctx_report(root, sid=None):
         rep["turn"] = dict(last, usd=turn_usd, baseline="message")
         rep["estimate"] = {
             "tokens": est,
-            "source": "第 %d 轮的 input + cache_read（逐轮数据）" % len(turns),
+            "source": ("最近 %d 轮里最后一轮的 input + cache_read（逐轮数据）"
+                       % len(turns)) if rep["truncated"] else
+                      ("第 %d 轮的 input + cache_read（逐轮数据）" % len(turns)),
         }
         rep["history"] = [{
             "ts": t["ts"], "ctx": t["ctx_tokens"], "usd": t["cost"],
@@ -1871,7 +1880,10 @@ def cmd_ctx(a):
         out("  会话 %s   %s/%s" % (row["session"][:20],
                                    row["provider"] or "?", row["model"] or "?"))
         if est and turn and turn.get("baseline") == "message":
-            line = "  第 %d 轮上下文 %s tok" % (rep["turns"], fmt_k(est))
+            if rep.get("truncated"):
+                line = "  最近 %d 轮里最后一轮的上下文 %s tok" % (rep["turns"], fmt_k(est))
+            else:
+                line = "  第 %d 轮上下文 %s tok" % (rep["turns"], fmt_k(est))
             if price and price["context"]:
                 line += "（窗口 %s 的 %.0f%%）" % (
                     fmt_k(price["context"]), est / price["context"] * 100.0)
@@ -1879,6 +1891,9 @@ def cmd_ctx(a):
             out("  构成 input %s + cache_read %s，本轮命中率 %.1f%%"
                 % (fmt_k(turn["input"]), fmt_k(turn["cache_read"]),
                    (turn["cache_read"] / est * 100.0) if est else 0.0))
+            if rep.get("truncated"):
+                out("  会话比这长：这里只看最近 %d 轮（判断「还能撑几轮」用不着更早的历史）"
+                    % CTX_WINDOW)
         elif est:
             out("  自上次采样以来 %s tok（%s）" % (fmt_k(est), rep["estimate"]["source"]))
         else:
