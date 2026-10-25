@@ -356,6 +356,22 @@ def main():
     expect("不在这个账本里" in body, "没有新轮次时也提醒别的会话没入账")
     expect("sync 一次只认一个会话" in body, "并说明原因")
 
+    # 计划里读不到建立时间时，宁可不报「同期」。把全部历史会话算成同期是假数，
+    # 比不报更坏 —— 这条规则要钉住，别哪天顺手改成「不知道就全算」。
+    pj = os.path.join(tmp14, ".plan", "plan.json")
+    with open(pj, encoding="utf-8") as fh:
+        plan_obj = json.load(fh)
+    plan_obj.pop("created", None)
+    with open(pj, "w", encoding="utf-8") as fh:
+        json.dump(plan_obj, fh, ensure_ascii=False)
+    d4 = run_json(tmp14, ["sync"])
+    expect(((d4 or {}).get("others") or {}).get("count") == 0,
+           "计划没有 created 时不计同期会话（实际 %s）"
+           % ((d4 or {}).get("others") or {}).get("count"))
+    r = run(tmp14, ["sync"])
+    expect("不在这个账本里" not in (r.stdout + r.stderr),
+           "也不打印那行提示（宁可不报，不猜）")
+
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:
         print("  - " + m)

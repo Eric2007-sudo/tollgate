@@ -2099,6 +2099,8 @@ def other_spenders(plan, cur_sid):
     这个下限很实在，每次 sync 都把它说出来，比等用户自己发现强。
     """
     since = plan_created_ms(plan)
+    if since is None:
+        return []          # 不知道计划什么时候建的，就别猜「同期」是哪一段 —— 宁可不报
     found = []
     for r in read_sessions():
         if r["session"] == cur_sid or r["cost"] <= 0:
@@ -2328,7 +2330,7 @@ def state_payload(root):
 
     # 同期在别处花的钱：账本只记一个会话，所以看板上的钱也是**下限**。
     # 只对「计划建立之后」的会话计数 —— 计划之前跑的花费跟这件事无关，报出来是噪音。
-    others = other_spenders(plan, sid) if plan.get("created") else []
+    others = other_spenders(plan, sid)
     money["other_sessions"] = len(others)
     money["other_usd"] = round(sum(r["cost"] for r in others), 12) if others else None
 
