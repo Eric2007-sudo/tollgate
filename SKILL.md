@@ -88,7 +88,7 @@ python tg.py serve            # 本地工作台，127.0.0.1:7717
 | `gate <n>` / `done <n>` | 跑验收断言 / 标记完成（断言失败会**拒绝**） |
 | `spend <n> --in N --out M --reqs K` | 手记一笔消耗（宿主读不到时用；`--reqs` 才是预算口径） |
 | `handoff <n>` | 自足式任务简报（给最弱执行者），换干净的上下文接着干。简报里带轮数上限和「这一步已经花了什么」，执行者能看见还剩多少余地 |
-| `report` / `status` / `show` / `resume` / `drift` / `reconcile` | 报表 / 摘要 / 全文 / 恢复 / 一致性 / 回归检查 |
+| `report` / `status` / `show` / `resume` / `drift` / `reconcile` | 报表 / 摘要 / 全文 / 恢复 / 一致性（含依赖链深度与成环）/ 回归检查 |
 
 ### 闸二：上下文与钱（tollgate 新增）
 

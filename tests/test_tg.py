@@ -200,6 +200,41 @@ def main():
     check("drift 报出缺 baseline", "baseline_context" in (r.stdout or ""))
     check("drift 报出缺轮数", "没有轮数" in (r.stdout or ""))
 
+    # ---------------- C2：drift 看依赖链的深度和环 ----------------
+    # 链太深不是执行问题，是计划结构问题：从第 4 层起，执行的人只能靠上一层的
+    # 转述去猜前因后果。成环更狠 —— 计划永远跑不完，parallel 直接报无法排序。
+    deep = tempfile.mkdtemp(prefix="pldepth_")
+    subprocess.run("git init -q", cwd=deep, shell=True, capture_output=True)
+    run(["init", "深链", "--why", "验 depth"], deep)
+    for i in range(1, 6):
+        dargs = ["add", "--title", "S%d" % i, "--out", "s%d/" % i,
+                 "--accept", "file:exists:s%d/x" % i, "--reuse", "line"]
+        if i > 1:
+            dargs += ["--depends", str(i - 1)]
+        run(dargs, deep)
+    r = run(["drift"], deep, expect=0)
+    dtx = r.stdout or ""
+    check("5 层链：drift 点名 #4 太深", "#4 的依赖链深 4 步" in dtx, dtx[:300])
+    check("5 层链：drift 点名 #5 太深", "#5 的依赖链深 5 步" in dtx, dtx[:300])
+    check("深度告警不误伤 3 层以内的步骤", "#3 的依赖链" not in dtx, dtx[:300])
+    check("深度告警给的是动作（拆 plan / 中间产物落文件）",
+          "拆成两个 plan" in dtx and "写成文件" in dtx, dtx[:300])
+
+    run(["amend", "1", "--depends", "5", "--reason", "故意造环"], deep)
+    r = run(["drift"], deep, expect=0)
+    dtx = r.stdout or ""
+    check("成环时 drift 点名环上的步骤",
+          "依赖成环" in dtx and "#1" in dtx and "#5" in dtx, dtx[:300])
+    check("成环时不再逐条报深度（一条结构问题不该刷成一屏）",
+          "依赖链深" not in dtx, dtx[:300])
+    check("成环时 drift 说清后果：计划永远跑不完", "永远跑不完" in dtx)
+    r = run(["parallel"], deep, expect=0)
+    check("成环时 parallel 明说无法排序（它不是闸，所以不靠退出码报错）",
+          "无法继续排序" in ((r.stdout or "") + (r.stderr or "")), (r.stdout or "")[:200])
+    pj2 = json.loads(run(["parallel", "--json"], deep).stdout)
+    check("成环时 parallel --json 的 stuck 列出全部步骤",
+          pj2.get("stuck") == [1, 2, 3, 4, 5], repr(pj2.get("stuck")))
+
     # ---------------- plan.json 被 Windows 编辑器加了 BOM 也要能读 ----------------
     # PowerShell 的 Set-Content、记事本、VS Code 另存都可能写 BOM。加了 BOM 还是同一份
     # 计划，不该让整个 CLI 崩掉 —— 这条在真实使用里踩到过。

@@ -115,6 +115,11 @@ JSON_API = 1
 # 「这几路各自产出的东西谁看、谁合、合不上怎么办」。
 MAX_FANOUT = 2
 
+# 依赖链深度上限。不是玄学：链一深，执行的人从第 4 层开始就在猜「当初为什么这么设计」
+# （anti-patterns 第 8 条「计划写 15 步」是同一件事的另一个侧面）。所以它进了 drift ——
+# 链太深已经不是执行问题，是计划结构问题。
+DRIFT_MAX_DEPTH = 3
+
 TIERS = ("cheap", "std", "deep")
 
 # Ponytail 的梯子：从「不需要存在」到「必须新写」，越靠前越省钱
@@ -646,6 +651,40 @@ def _deps_done(plan, step):
         if ds["status"] != "done":
             return False, "#%d 还没完成" % d
     return True, ""
+
+
+def _chain_depth(plan, n):
+    """这一步的依赖链有多深（根为 1）。成环返回 -1。
+
+    和 `orch.chain_depth()` 是**同一套算法，故意重复**：tg 是内核、orch 是上层，
+    内核反向 import 上层会让「tg.py 单文件可以单独拷走」这件事失效
+    （install.ps1 装的是两份并列文件，不是包）。改算法时两边一起改。
+    """
+    by = {s["n"]: s for s in plan["steps"]}
+    memo = {}
+
+    def walk(x, stack):
+        if x in memo:
+            return memo[x]
+        if x in stack:
+            return -1
+        s = by.get(x)
+        if s is None:
+            return 0
+        deps = [d for d in (s.get("depends") or []) if d in by]
+        if not deps:
+            memo[x] = 1
+            return 1
+        best = 0
+        for d in deps:
+            sub = walk(d, stack | {x})
+            if sub < 0:
+                return -1
+            best = max(best, sub)
+        memo[x] = best + 1
+        return memo[x]
+
+    return walk(n, set())
 
 
 def cmd_ready(a):
@@ -1829,6 +1868,21 @@ def cmd_drift(a):
         problems.append("禁读清单为空（上下文最容易在这里失控）")
     if len(plan["steps"]) > 8:
         problems.append("步骤数 %d > 8，建议拆成两个 plan" % len(plan["steps"]))
+    # 依赖链：成环 = 计划永远跑不完；太深 = 交接次数多到执行的人开始猜设计意图。
+    depths = {s["n"]: _chain_depth(plan, s["n"]) for s in plan["steps"]}
+    cyc = sorted(n for n, d in depths.items() if d < 0)
+    if cyc:
+        problems.append("依赖成环：%s（这个计划永远跑不完，parallel 会直接报无法排序）"
+                        % "、".join("#%d" % n for n in cyc))
+    else:
+        for n in sorted(depths):
+            d = depths[n]
+            if d > DRIFT_MAX_DEPTH:
+                problems.append(
+                    "#%d 的依赖链深 %d 步（> %d）：每一层都要靠上一层的上下文，"
+                    "交接次数一多，执行的人就开始猜当初为什么这么设计 —— "
+                    "拆成两个 plan，或把中间产物写成文件让后一步去读"
+                    % (n, d, DRIFT_MAX_DEPTH))
     if not plan.get("why"):
         problems.append("没写 why（这个任务该不该存在，没人回答过）")
     unrated = [s for s in plan["steps"] if not s.get("reuse")]

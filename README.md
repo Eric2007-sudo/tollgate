@@ -390,19 +390,19 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 ## 测试
 
 ```bash
-python tests/test_tg.py        # 171 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限
+python tests/test_tg.py        # 191 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限 / 依赖链深度与成环
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
 python tests/test_orch.py      # 66 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态
 python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
 ```
 
-合计 **412 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **432 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 412）
+python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 432）
 ```
 
 ---
