@@ -551,6 +551,7 @@ def cmd_init(a):
         "updated": now_iso(),
         "git_head": git_head(root),
         "max_rounds": a.max_rounds,
+        "max_cost": a.max_cost,
         "baseline_context": a.baseline_context,
         "exclude": list(a.exclude or []),
         "acks": [],
@@ -814,6 +815,24 @@ def cmd_start(a):
     if s["status"] == "done":
         die("#%d 已经是 done。真要重做，先 tg reset %d" % (a.n, a.n))
 
+    # 钱的上限：账本是**下限**（同期别的会话、没 sync 的轮次都不在里面），
+    # 所以「已知就超了」意味着实际一定超了 —— 拿下限当上限用只会提前拦，不会放行。
+    # 不设 --max-cost 就不猜：没设 = 你自己在盯。
+    # 也不拿每步的 budget 当刹车：那个默认 8000 只是探测器刻度，不是钱。
+    mc = plan.get("max_cost") or 0
+    if mc:
+        spent_usd, _rows = cost_for(load_ledger(root))
+        if spent_usd is None:
+            warn("计划设了花费上限 $%.6f，但账本里没有一项带真实 cost —— "
+                 "这个上限现在拦不住任何东西。真账只能由 tg sync 记（手记 spend 不带钱）。"
+                 % mc)
+        elif spent_usd >= mc:
+            die("已知花费 $%.6f 已经到上限 $%.6f，再开 #%d 只会更超。\n"
+                "    账本只是**下限**，所以「已知就超了」意味着实际一定超了 —— "
+                "这不是保守估计。\n"
+                "    真要接着花：先把上限改高，留个痕 —— tg amend 0 --max-cost 一个比\n"
+                "    $%.6f 大的数（例如 %.6f）" % (spent_usd, mc, a.n, spent_usd, spent_usd * 2))
+
     # 并发不是免费的速度：同时 doing 的步数有硬上限。
     # 原先这里是「一次只做一步」，于是 A 阶段做真两路并发时只能绕过 start 直接
     # `sync --step N --session <id>`——那一路没有 started_ms，归账边界退化成计划
@@ -917,6 +936,9 @@ def cmd_amend(a):
         if a.max_rounds is not None and a.max_rounds != plan.get("max_rounds", 3):
             changes["max_rounds"] = [plan.get("max_rounds", 3), a.max_rounds]
             plan["max_rounds"] = a.max_rounds
+        if a.max_cost is not None and a.max_cost != plan.get("max_cost"):
+            changes["max_cost"] = [plan.get("max_cost"), a.max_cost]
+            plan["max_cost"] = a.max_cost
         if a.baseline_context is not None \
                 and a.baseline_context != plan.get("baseline_context", 0):
             changes["baseline_context"] = [plan.get("baseline_context", 0),
@@ -931,7 +953,7 @@ def cmd_amend(a):
             changes["exclude+"] = added
         if not changes:
             die("amend 0 没有任何改动。可用：--goal / --why / --max-rounds / "
-                "--baseline-context / --add-exclude")
+                "--max-cost / --baseline-context / --add-exclude")
         plan["updated"] = now_iso()
         append_ledger(root, {"ts": now_iso(), "step": 0, "in": 0, "out": 0,
                              "amend": changes, "note": a.reason or ""})
@@ -1231,7 +1253,8 @@ def cmd_status(a):
                          "budget": budget, "spent": spent, "pct": pct,
                          "blocked": len(blocked),
                          "reqs": reqs_for(ledger),
-                         "cost_usd": tot_cost},
+                         "cost_usd": tot_cost,
+                         "max_cost": plan.get("max_cost") or 0},
             "current": ({"n": cur["n"], "title": cur["title"],
                          "tier": cur["tier"], "out": cur.get("out", ""),
                          "status": cur["status"],
@@ -1266,6 +1289,16 @@ def cmd_status(a):
     out("[PLAN %s] 目标: %s" % (plan["id"], goal))
     out("进度: %d/%d · 预算 %s/%s (%d%%) · 卡点 %d"
         % (done, total, fmt_k(spent), fmt_k(budget), pct, len(blocked)))
+    mc = plan.get("max_cost") or 0
+    if mc:
+        usd, _urows = cost_for(ledger)
+        if usd is None:
+            out("钱: 上限 $%.6f，但账本里没有一项带真实 cost —— 这个上限现在还拦不住"
+                "任何东西（真账只能由 tg sync 记）" % mc)
+        else:
+            out("钱: $%.6f / 上限 $%.6f（%d%%）%s"
+                % (usd, mc, int(usd / mc * 100),
+                   "  ← 到顶了，tg start 会拒绝" if usd >= mc else ""))
     if len(doing) > 1:
         # 「当前」不许在多路并发时只报一个：那样看起来像只有它在干活，
         # 另一路的钱和轮数就没人盯着了。
@@ -1866,6 +1899,15 @@ def cmd_drift(a):
             problems.append("#%d 已完成但它依赖的 %s（依赖顺序反了）" % (s["n"], why))
     if not plan.get("exclude"):
         problems.append("禁读清单为空（上下文最容易在这里失控）")
+    mc = plan.get("max_cost") or 0
+    if mc:
+        usd, _urows = cost_for(ledger)
+        if usd is None:
+            problems.append("设了花费上限 $%.6f，但账本里没有一项带真实 cost —— "
+                            "这个上限现在是空的（真账只有 tg sync 记得下来）" % mc)
+        elif usd >= mc:
+            problems.append("已知花费 $%.6f 已到上限 $%.6f：tg start 会拒绝新步骤，"
+                            "要接着做先 tg amend 0 --max-cost" % (usd, mc))
     if len(plan["steps"]) > 8:
         problems.append("步骤数 %d > 8，建议拆成两个 plan" % len(plan["steps"]))
     # 依赖链：成环 = 计划永远跑不完；太深 = 交接次数多到执行的人开始猜设计意图。
@@ -3136,6 +3178,8 @@ def main():
     p.add_argument("--exclude", action="append", help="禁读路径，可重复")
     p.add_argument("--max-rounds", dest="max_rounds", type=int, default=3,
                    help="单步最多重试轮次，到顶强制 block（默认 3）")
+    p.add_argument("--max-cost", dest="max_cost", type=float, default=None,
+                   help="整个计划最多花多少美元（账本口径，只是下限）；到顶后 tg start 拒绝")
     p.add_argument("--baseline-context", dest="baseline_context", type=int, default=0,
                    help="本会话一次请求的典型上下文 token 数，用于把轮数预算折算成钱")
     p.add_argument("--force", action="store_true")
@@ -3164,6 +3208,8 @@ def main():
     p.add_argument("--goal")
     p.add_argument("--why")
     p.add_argument("--max-rounds", dest="max_rounds", type=int)
+    p.add_argument("--max-cost", dest="max_cost", type=float,
+                   help="整个计划的花费上限（美元，账本口径）；到顶后 tg start 拒绝")
     p.add_argument("--baseline-context", dest="baseline_context", type=int)
     p.add_argument("--add-exclude", dest="add_exclude", action="append")
     p.add_argument("--title")

@@ -235,6 +235,61 @@ def main():
     check("成环时 parallel --json 的 stuck 列出全部步骤",
           pj2.get("stuck") == [1, 2, 3, 4, 5], repr(pj2.get("stuck")))
 
+    # ---------------- C3：花费到顶就不许再开新步骤 ----------------
+    # 「预算」在 tg 里一直有两种：token（探测器刻度，默认 8000 不是钱）和钱。
+    # 刹车只能挂在钱上，而且只能用「账本里已知的钱」——账本是下限，拿它当上限用
+    # 只会提前拦、不会放行，这个方向是安全的；反过来就会假装自己有刹车。
+    cost_dir = tempfile.mkdtemp(prefix="plcost_")
+    subprocess.run("git init -q", cwd=cost_dir, shell=True, capture_output=True)
+    run(["init", "花费上限", "--why", "验 C3", "--max-cost", "0.2"], cost_dir)
+    check("init --max-cost 写进计划", plan_json(cost_dir).get("max_cost") == 0.2,
+          repr(plan_json(cost_dir).get("max_cost")))
+    for i in (1, 2):
+        run(["add", "--title", "S%d" % i, "--out", "s%d/" % i,
+             "--accept", "file:exists:s%d/x" % i, "--reuse", "line"], cost_dir)
+    r = run(["start", "1"], cost_dir)
+    ctxt = (r.stdout or "") + (r.stderr or "")
+    check("账本里没有真实 cost 时：不假拦，但明说「拦不住」",
+          r.returncode == 0 and "拦不住任何东西" in ctxt, ctxt[:300])
+
+    # 造一笔已知花费（手记 spend 不带钱，带 cost 的行只有 sync 会写）
+    with open(os.path.join(cost_dir, ".plan", "ledger.jsonl"), "a",
+              encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": "2026-10-25T23:00:00", "step": 1, "in": 1000,
+                             "out": 100, "reqs": 1, "cost": 0.5,
+                             "src": "opencode.db"}) + "\n")
+    r = run(["start", "2"], cost_dir, expect=2)
+    check("已知花费超上限时 start 直接拒绝", r.returncode == 2)
+    check("拒绝时讲清「账本只是下限，所以一定超了」",
+          "下限" in r.stderr and "一定超" in r.stderr, r.stderr[:300])
+    check("拒绝时 stdout 一个字都不写（错误只走 stderr）",
+          (r.stdout or "").strip() == "", repr((r.stdout or "")[:80]))
+    check("拒绝时建议的新上限比实际花费大，不是把旧上限乘 2",
+          "1.000000" in r.stderr and "0.400000" not in r.stderr, r.stderr[:300])
+
+    r = run(["status"], cost_dir, expect=0)
+    check("status 印出钱与上限", "上限 $0.200000" in (r.stdout or ""),
+          (r.stdout or "")[:300])
+    stj = json.loads(run(["status", "--json"], cost_dir).stdout)
+    check("status --json 的 progress 带 max_cost（加字段不升版）",
+          stj["progress"].get("max_cost") == 0.2, repr(stj["progress"].get("max_cost")))
+
+    run(["amend", "0", "--max-cost", "1.0", "--reason", "确实要接着做"], cost_dir)
+    r = run(["start", "2"], cost_dir)
+    check("把上限改高之后放行（改高要留痕，不给 --force 后门）",
+          r.returncode == 0, (r.stderr or "")[:200])
+
+    # 没设上限就不许拦：没设 = 你自己在盯，替人做主比不拦更坏
+    nocap = tempfile.mkdtemp(prefix="plnocap_")
+    subprocess.run("git init -q", cwd=nocap, shell=True, capture_output=True)
+    run(["init", "没上限", "--why", "验不假拦"], nocap)
+    run(["add", "--title", "S1", "--out", "s/", "--accept", "file:exists:s/x",
+         "--reuse", "line"], nocap)
+    r = run(["start", "1"], nocap)
+    ntxt = (r.stdout or "") + (r.stderr or "")
+    check("没设 --max-cost 时不拦也不唠叨上限",
+          r.returncode == 0 and "上限" not in ntxt, ntxt[:200])
+
     # ---------------- plan.json 被 Windows 编辑器加了 BOM 也要能读 ----------------
     # PowerShell 的 Set-Content、记事本、VS Code 另存都可能写 BOM。加了 BOM 还是同一份
     # 计划，不该让整个 CLI 崩掉 —— 这条在真实使用里踩到过。

@@ -100,6 +100,15 @@ reconcile  report  ack  status  show  resume  drift
 会话**。有 2 步 `doing` 时 `gate` / `sync` 不带编号会直接拒绝并把候选编号列出来——猜错
 等于给错的步骤发通行证、把两路的钱记到一步上。理由见局限 #18。
 
+钱也有上限：`init --max-cost 0.5` / `tg amend 0 --max-cost 1.2`（美元）。账本里**已知**花费
+到顶后 `tg start` 直接拒绝新步骤，`status` 与 `drift` 也会点出来。只剩一种升级方式：把上限
+改高（会写进 ledger 留痕），**没有 `--force` 后门**——否则「上限」就只是一句口号。
+
+这里有个口径必须说清：账本是**下限**（同期别的会话、没 sync 的轮次都不在里面），所以
+「已知就超了」意味着实际一定超了——拿下限当上限用只会提前拦，不会放行，这个方向是安全的。
+反过来就不安全：如果账本里**一项带真实 `cost` 的记录都没有**（只用手记 `spend`，从不 `sync`），
+那这个上限拦不住任何东西，`tg start` 会当场说「拦不住」而不是假装自己在拦。
+
 **闸二 · 上下文与钱**
 
 ```
@@ -369,6 +378,11 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 19. `orch rollup` 不加 `--gate` 时**不做**断言与语义的打架检测（因为 `status=done` 只说明
     「当时过了」，代码可能已经变了），并且明说「没查」。所以默认模式的 rollup **不能**
     当验收证据；要证据就加 `--gate`，慢但是真数据。
+20. `--max-cost` 的刹车只连着**账本**，而账本是下限（见 #14）。所以它只会**提前**拦，
+    绝不放行：已知花费到顶就拒绝 `tg start`。反过来说，如果你从不用 `tg sync`、只用手记
+    `spend`，账本里就一项带真实 `cost` 的记录都没有——那时这个上限**拦不住任何东西**，
+    `tg start` 会当场说出来，而不是让你以为有刹车。它也不管「没入账的花费」：
+    同期别的会话多花了 $38，上限照样显示没到。
 
 ---
 
@@ -390,19 +404,19 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 ## 测试
 
 ```bash
-python tests/test_tg.py        # 191 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限 / 依赖链深度与成环
+python tests/test_tg.py        # 213 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限 / 依赖链深度与成环 / 花费上限到顶拒绝
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
 python tests/test_orch.py      # 66 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态
 python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
 ```
 
-合计 **432 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **454 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 432）
+python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 454）
 ```
 
 ---

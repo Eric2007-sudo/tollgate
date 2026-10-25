@@ -69,6 +69,7 @@ BOM 只影响第一行，而账本第一行丢掉等于悄悄少记一笔钱—�
   "updated": "2026-10-25T11:29:34",
   "git_head": "cacdcb8",
   "max_rounds": 3,
+  "max_cost": 0.5,
   "baseline_context": 150000,
   "exclude": ["node_modules/", "dist/", "*.lock"],
   "acks": ["ack:向用户确认旧 session 表可以下线"],
@@ -117,6 +118,7 @@ BOM 只影响第一行，而账本第一行丢掉等于悄悄少记一笔钱—�
 | `why` | 这个任务为什么该存在。空的会在 `drift` 里被点出来 | `init --why` |
 | `git_head` | 建计划时的 `git rev-parse --short HEAD`。用于漂移检查 | `init` |
 | `max_rounds` | 单步重试上限。`start` 到顶会强制 block，防死循环烧钱 | `init --max-rounds` |
+| `max_cost` | 整个计划的**钱**上限（美元）。账本里已知花费到顶后 `tg start` 直接拒绝新步骤。0 / 缺失 = 未设 = 你自己在盯。**只能用账本下限当依据**：已知就超了，实际一定超了 | `init --max-cost` / `amend 0 --max-cost` |
 | `baseline_context` | 一次请求的典型上下文 token 数。**兜底用**：`sync` 读不到宿主逐轮数据时，`report` 才拿它把轮数折算成钱；0 = 未设 | `init --baseline-context` / `amend 0` |
 | `exclude` | 禁读清单 | `init --exclude` / `exclude` |
 | `acks` | 已确认的 `ack:` 断言 | `ack` |
@@ -154,6 +156,7 @@ tg amend 3 --rounds 6 --reason "测试要跑三遍"      # 改轮数预算
 tg amend 3 --depends 1,2                          # 整体替换依赖；空串 = 清空
 tg amend 0 --baseline-context 150000              # 0 = 计划级设置
 tg amend 0 --add-exclude "data/*.json" --max-rounds 2
+tg amend 0 --max-cost 1.20                        # 钱到顶了、确实要接着做：改高（留痕）
 ```
 
 护栏：改 `done` 步骤默认被拒（`exit 2`）。真需要改就 `--force`，ledger 里那行会带
