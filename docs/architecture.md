@@ -11,7 +11,7 @@
   .plan/plan.json ◀──▶ │  基础设施  find_root / paths / load / save  │
   .plan/ledger.jsonl◀─▶│  渲染     render / plan.md                  │
   .plan/ctx.jsonl  ◀──▶│  断言     run_check / run_gates             │
-                       │  命令     cmd_*(24 个)                      │
+                       │  命令     cmd_*(25 个)                      │
                        └───────┬──────────────────────┬─────────────┘
                                │                      │
             闸一：plan 模型      │                      │  闸二：用量模型
@@ -32,8 +32,9 @@
 | 面 | 谁写 | 谁读 | 作用 |
 |---|---|---|---|
 | `.plan/plan.json` | `init` / `add` / `amend` | 全部命令、看板 | **唯一的计划真相** |
-| `.plan/ledger.jsonl` | `spend` / `gate` / `done` / `reset` | `report` / 看板 | 只追加的审计流水 |
-| `opencode.db` | 宿主（OpenCode）自己 | `ctx` / `price` / 看板 | 真实 token 与钱，**只读** |
+| `.plan/ledger.jsonl` | `spend` / `sync` / `gate` / `done` / `reset` | `report` / 看板 | 只追加的审计流水 |
+| `.plan/sync.json` | `sync` | `sync` 自己 | 对账游标：已入账的消息 id |
+| `opencode.db` | 宿主（OpenCode）自己 | `ctx` / `price` / `sync` / 看板 | 真实 token 与钱，**只读** |
 
 关键约束：**tollgate 从不写宿主的库**。`opencode.db` 用 `file:<path>?mode=ro` 打开，避免和正在跑的会话抢锁。反过来，宿主也从不知道 tollgate 的存在——这是"能随时卸载"的前提。
 
@@ -51,8 +52,9 @@
 | **价格与账本** | `opencode_config` / `load_prices` / `opencode_db` / `read_sessions` / `current_session` / `cost_usd` |
 | **逐轮数据** | `read_turns`（解析消息里的 `tokens`）/ `growth_rate`（中位数增速） |
 | **上下文报告** | `ctx_report`（唯一的口径聚合点）/ `cmd_ctx` / `cmd_price` |
+| **两闸交界** | `load_sync` / `save_sync`（游标）/ `cmd_sync`（把逐轮用量写进账本） |
 | **工作台** | `state_payload`（把上面全部打包成 JSON）/ `_make_handler` / `cmd_serve` |
-| 入口 | argparse，24 个子命令 |
+| 入口 | argparse，25 个子命令 |
 
 ## 一次 `tg ctx` 的数据流
 
@@ -83,6 +85,37 @@ current_session()          挑会话：--session > $OPENCODE_SESSION_ID > 最近
 | 连估计也没有 | —— | `estimate.tokens = null`，明说"未知" |
 
 绝不把累计值冒充单轮值。这是这个项目最容易犯、也最致命的错误（曾经真的算出过"占窗口 28810%"）。
+
+## 两闸交界：`tg sync` 的数据流
+
+闸一需要"这一步花了多少"，闸二手里有"每一轮真实花了多少"，而人肉把后者抄成前者是纯粹的浪费。
+
+```
+current_session()            挑会话（同 ctx）
+      │
+      ├── load_sync()        读 .plan/sync.json 里的已入账 id 集合
+      │
+      ├── read_turns(sid)    最新 2000 轮，逐轮 tokens + cost
+      │        │
+      │        └── 过滤掉已在游标里的 → fresh[]
+      │                 │
+      │                 ├── in  = Σ input
+      │                 ├── out = Σ (output + reasoning)
+      │                 ├── reqs= len(fresh)
+      │                 └── cost= Σ cost   （为 0 时按 load_prices 重算，标 cost_est）
+      │
+      ├── append_ledger()    写一笔 {step, in, out, reqs, cache_read, cost, src}
+      └── save_sync()        游标前移，上限 2000 条
+```
+
+三个设计决定：
+
+1. **口径不新开**：`sync` 写的就是 `spend` 那个格式，`spent_for()` / `reqs_for()` 一行都不用改。
+   缓存读单列存进记录但不参与求和——预算口径是"新 token"，缓存命中只是重读。
+2. **游标窗口 = 读窗口**（都是 2000）。两者必须相等才能同时保证"读到的都认得"和
+   "认得的都在读窗口里"，于是既不重复记账、也不会因为游标比窗口窄而反复重记。
+3. **归账宁可拒绝**：没有 `doing` 的步骤时直接非 0 退出，而不是猜一个步骤记上去。
+   记到错的地方比不记更坏——账本的价值全在可信。
 
 ## 工作台为什么是静态页
 

@@ -27,6 +27,12 @@ tollgate 0.1 新增：
                             + codebase-memory-mcp（按需检索）+ claude-mem（本地只读看板）
                             先算「这一轮值多少钱」，再比较「压缩」和「换会话」哪个更省
 
+tollgate 0.2 新增：
+  sync                    两闸交界：把 session_message 里逐轮真实的 tokens/cost
+                          自动写进账本，取代手填 spend。口径与 spend 完全一致
+                          （in 只算新输入，out 含推理，cache_read 单列不入预算），
+                          游标存在 .plan/sync.json，同一轮永远不会重复记账。
+
 四条不变的设计约束：
   1. 零依赖      只用标准库，Windows / macOS / Linux 同一份代码
   2. 单一真相    .plan/plan.json 是唯一真源，plan.md 只是渲染视图
@@ -1931,6 +1937,201 @@ def cmd_price(a):
         "所以这里的钱是上界。")
 
 
+# ---------------------------------------------------------------- 两闸交界
+#
+# 闸一（计划预算）原先靠手填 `tg spend <n> --in M --out K --reqs R` 记账，而闸二
+# 已经能从 session_message 里读出每一轮真实的 tokens 和 cost。中间那道缝不该让
+# 人去补：`tg sync` 把「上次 sync 之后宿主真实跑掉的轮次」直接写进账本。
+#
+# 口径与 spend 严格一致，不另立一套：
+#   in      = Σ 每轮 input（新输入，不含缓存命中）
+#   out     = Σ (output + reasoning)   —— 推理 token 按输出价计费，算进新 token
+#   reqs    = 轮数（assistant 消息条数）
+#   cache_read / cache_write 单列存进记录，但不参与预算求和 —— 命中只是便宜的重读，
+#   混进预算会让「该压上下文还是该换会话」的判断失真（见 references/context-budget.md）。
+#
+# 归账只能归到「正在做」的那一步：宿主不知道你的步骤边界，sync 也不知道你在哪
+# 一轮切了步骤。所以切步骤之前先 sync 一次，是使用者的责任，工具如实说这句话。
+
+SYNC_KEEP = 2000
+
+# 读窗口和游标窗口必须是同一个数：游标记住的就是读窗口里的那些 id。窗口对齐
+# 才能保证「读到的轮次全都认得、认得的都在读窗口里」，既不重复记账，也不会因为
+# 游标比窗口窄而反复重记。窗口之外更早的轮次（只有长得离谱的会话才会遇到）第一
+# 次对账时会被跳过 —— 这件事必须说出来，不能默默截断。
+
+
+def sync_path(root):
+    return paths(root)["dir"] / "sync.json"
+
+
+def load_sync(root):
+    """读取同步游标：已入账的消息 id 集合。空/坏文件一律当「从没同步过」。"""
+    blank = {"session": "", "ids": []}
+    p = sync_path(root)
+    if not p.is_file():
+        return blank
+    try:
+        d = json.loads(p.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return blank
+    if not isinstance(d, dict):
+        return blank
+    ids = d.get("ids")
+    return {
+        "session": str(d.get("session") or ""),
+        "ids": [str(x) for x in ids] if isinstance(ids, list) else [],
+    }
+
+
+def save_sync(root, data):
+    p = sync_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session": data.get("session", ""),
+        "ids": (data.get("ids") or [])[-SYNC_KEEP:],
+        "updated": now_iso(),
+    }
+    with open(p, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+
+
+def cmd_sync(a):
+    """把宿主的真实用量对账进账本，替代手填 spend。"""
+    root = find_root()
+    plan = load(root)
+
+    row = current_session(getattr(a, "session", None))
+    if row is None:
+        die("读不到宿主的用量库（opencode.db）。没有真实用量就没法对账 ——"
+            "这种情况下只能继续手填：tg spend <n> --in M --out K --reqs R")
+
+    if a.step is not None:
+        s = step_by_n(plan, a.step)
+    else:
+        s = next((x for x in plan["steps"] if x.get("status") == "doing"), None)
+        if s is None:
+            die("当前没有 doing 的步骤，用量无处可归。先 tg start N，"
+                "或者显式指定：tg sync --step N")
+
+    turns = read_turns(row["session"], limit=SYNC_KEEP)
+    truncated = len(turns) >= SYNC_KEEP
+    state = load_sync(root)
+    if state["session"] != row["session"]:
+        # 换了会话就从零算：上一个会话的 id 与这个会话无关
+        state = {"session": row["session"], "ids": []}
+    seen = set(state["ids"])
+    fresh = [t for t in turns if t["id"] not in seen]
+
+    if not fresh:
+        msg = "没有新轮次：会话 %s 最近 %d 轮都已入账。" % (
+            row["session"][:12], len(turns))
+        if a.json:
+            out(json.dumps({"ok": True, "fresh": 0, "turns_read": len(turns),
+                            "session": row["session"], "step": s["n"]},
+                           ensure_ascii=False, indent=1))
+        else:
+            out(msg)
+        return
+
+    tin = sum(t["input"] for t in fresh)
+    tout = sum(t["output"] for t in fresh)
+    trea = sum(t["reasoning"] for t in fresh)
+    tcr = sum(t["cache_read"] for t in fresh)
+    tcw = sum(t["cache_write"] for t in fresh)
+    host_cost = sum(t["cost"] for t in fresh)
+
+    prices, _ = load_prices()
+    est, est_ok = 0.0, False
+    for t in fresh:
+        pr = prices.get((t["provider"], t["model"])) or prices.get(
+            (row["provider"], row["model"]))
+        c = cost_usd(t["input"], t["output"], t["reasoning"],
+                     t["cache_read"], t["cache_write"], pr)
+        if c is not None:
+            est += c
+            est_ok = True
+    if host_cost > 0:
+        cost, cost_src = host_cost, "宿主记录"
+    elif est_ok:
+        cost, cost_src = est, "按配置单价重算（上界）"
+    else:
+        cost, cost_src = None, "未知（宿主的消息里没 cost，本地也没价目）"
+
+    rec = {"ts": now_iso(), "step": s["n"], "in": tin, "out": tout + trea,
+           "reqs": len(fresh), "cache_read": tcr, "src": "opencode.db",
+           "note": "sync 自动对账（%d 轮）" % len(fresh)}
+    if tcw:
+        rec["cache_write"] = tcw
+    if cost is not None:
+        rec["cost"] = round(cost, 12)
+        if host_cost <= 0:
+            rec["cost_est"] = True
+
+    if a.dry_run:
+        ledger_after = load_ledger(root) + [rec]
+    else:
+        append_ledger(root, rec)
+        state["ids"] = (state["ids"] or []) + [t["id"] for t in fresh]
+        state["session"] = row["session"]
+        save_sync(root, state)
+        ledger_after = load_ledger(root)
+
+    used = spent_for(ledger_after, s["n"])
+    reqs = reqs_for(ledger_after, s["n"])
+    budget = s.get("budget", 0)
+    br = s.get("budget_rounds", 0)
+    pct = (used / budget * 100) if budget else 0
+    over_budget = bool(budget) and used > budget
+    over_rounds = bool(br) and reqs > br
+
+    if a.json:
+        out(json.dumps({
+            "ok": True, "fresh": len(fresh), "turns_read": len(turns),
+            "session": row["session"], "step": s["n"],
+            "synced": {"in": tin, "out": tout, "reasoning": trea,
+                       "reqs": len(fresh), "cache_read": tcr,
+                       "cache_write": tcw},
+            "cost": cost, "cost_src": cost_src, "dry_run": bool(a.dry_run),
+            "step_total": {"tokens": used, "budget": budget, "pct": round(pct, 1),
+                           "reqs": reqs, "budget_rounds": br},
+            "over_budget": over_budget, "over_rounds": over_rounds,
+            "truncated": truncated, "record": rec,
+        }, ensure_ascii=False, indent=1))
+        return
+
+    out("== 对账（源：opencode.db） ==")
+    out("  会话 %s ｜ 本次同步 %d 轮（上次 sync 之后）" % (row["session"][:12], len(fresh)))
+    if truncated:
+        out("  只读到最近 %d 轮 —— 更早的轮次读不到，也就不会计入。这时的 tok 数"
+            "不等于「会话总共跑了多少」，那看 tg ctx。" % SYNC_KEEP)
+    out("  记入 #%d：新输入 %s + 输出 %s（其中推理 %s）= %s tok"
+        % (s["n"], fmt_k(tin), fmt_k(tout), fmt_k(trea), fmt_k(tin + tout + trea)))
+    if tcr or tcw:
+        out("  缓存读 %s / 写 %s —— 不计入预算：命中只是便宜的重读，"
+            "不占新 token" % (fmt_k(tcr), fmt_k(tcw)))
+    out("  钱：%s · %s" % (money(cost), cost_src))
+    out("")
+    out("== 这一步累计 ==")
+    out("  #%d %s / %s（%.0f%%）" % (s["n"], fmt_k(used), fmt_k(budget), pct))
+    if reqs:
+        line = "  轮数：%d 轮" % reqs
+        if br:
+            line += "（预算 %d 轮）" % br
+        line += " ｜ 单轮平均 %s" % fmt_k(int(used / reqs))
+        out(line)
+    if a.dry_run:
+        out("")
+        out("--dry-run：没写账本，游标没动，下次 sync 还会看到这 %d 轮。" % len(fresh))
+    else:
+        out("  已写入 .plan/ledger.jsonl；游标 → .plan/sync.json")
+    if over_rounds:
+        warn("已用 %d 轮，超过本步预算 %d 轮。继续之前先想：是任务本身要这么多轮，"
+             "还是每轮都在重新读同一批文件？" % (reqs, br))
+    if over_budget:
+        warn("超预算 %s tok。看 tg ctx：该压上下文还是该换会话，那里有数。" % fmt_k(used - budget))
+
+
 # ---------------------------------------------------------------- 工作台
 
 def ui_dir():
@@ -2076,7 +2277,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="tg", description="tollgate：agent 的过闸 —— 计划预算 · 上下文预算 · 本地账本")
     ap.add_argument("-V", "--version", action="version",
-                    version="tollgate 0.1（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
+                    version="tollgate 0.2（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="建立 .plan/")
@@ -2215,6 +2416,14 @@ def main():
 
     p = sub.add_parser("price", help="列出配置里的模型价目（USD/百万 token）")
     p.set_defaults(fn=cmd_price)
+
+    p = sub.add_parser("sync", help="把宿主的真实用量对账进账本（不用再手填 spend）")
+    p.add_argument("--step", type=int, help="归到哪一步（默认当前 doing 的那一步）")
+    p.add_argument("--session", help="会话 id（默认 $OPENCODE_SESSION_ID 或最近一条）")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="只报数，不写账本、不动游标")
+    p.add_argument("--json", action="store_true", help="机器可读输出")
+    p.set_defaults(fn=cmd_sync)
 
     p = sub.add_parser("serve", help="本地工作台（127.0.0.1，只读 + 采样）")
     p.add_argument("--port", type=int, default=7717)

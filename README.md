@@ -74,6 +74,7 @@ python tg.py add --title "抽出 io 层" --out "src/io.py" --budget 30000 --roun
 python tg.py serve            # 打开 http://127.0.0.1:7717/
 ```
 
+干完一步就 `python tg.py sync` —— 宿主跑掉多少轮、多少 token、多少钱，自动记进账本。
 装成 skill：
 
 ```powershell
@@ -85,7 +86,7 @@ python tg.py serve            # 打开 http://127.0.0.1:7717/
 
 ---
 
-## 子命令（24 个）
+## 子命令（25 个）
 
 **闸一 · 计划与预算**
 
@@ -103,6 +104,46 @@ price                                    列出配置里各模型的价目
 serve [--port 7717] [--no-open]          本地只读工作台
 ```
 
+**两闸交界**
+
+```
+sync [--step N] [--dry-run] [--json]     把宿主逐轮真实用量写进账本，取代手填 spend
+```
+
+---
+
+## 账不用手记：`tg sync`
+
+闸一原先要人肉记账（`tg spend 3 --in 12000 --out 900 --reqs 2`），可闸二已经能把每一轮的
+`tokens` 和 `cost` 从 `session_message` 里读出来了。中间那道缝不该让人去补：
+
+```bash
+python tg.py start 2
+# ...干活，让 agent 跑几轮...
+python tg.py sync                 # 自动把「上次 sync 之后的新轮次」记进 #2
+python tg.py sync --dry-run       # 只报数，不写账本、不动游标
+```
+
+口径和 `spend` **完全一致**，不另立一套：
+
+| 账本字段 | 取什么 | 为什么 |
+|---|---|---|
+| `in` | Σ 每轮 `tokens.input` | 新输入；缓存命中不计入 |
+| `out` | Σ(`output` + `reasoning`) | 推理 token 按输出价计费，属于新 token |
+| `reqs` | 轮数 = 带 tokens 的 assistant 消息条数 | 轮数才是靠谱的预算单位 |
+| `cost` | Σ 每轮真实 `cost`；宿主没记就按配置单价重算并标 `cost_est` | 有真账就用真账 |
+| `cache_read` / `cache_write` | 单列存进记录，**不参与预算求和** | 命中只是便宜的重读，混进预算会让"该压还是该换手"判断失真 |
+
+游标存在 `.plan/sync.json`（已入账的消息 id 集合），所以：
+
+- 同一轮**永远不会重复记账**，多跑几次 `sync` 是安全的；
+- 换会话自动从零算，旧会话的游标吃不掉新会话的轮次；
+- 游标文件坏了就当从没同步过，从头重算，不崩。
+
+两个诚实的边界：**归账只能归到"正在做"的那一步**（宿主不知道你的步骤边界，所以切步骤
+前先 `sync` 一次是你的事）；**读窗口是最新 2000 轮**，更早的读不到也就不计入，这时输出
+会明说，别把那次的 tok 数当成"会话总共跑了多少"（那看 `tg ctx`）。
+
 ---
 
 ## 数据从哪来，钱怎么算
@@ -111,6 +152,7 @@ serve [--port 7717] [--no-open]          本地只读工作台
 |---|---|---|
 | 逐轮上下文 | `session_message.data` 的 `tokens` | `input + cache.read` = 这一轮真正送进模型的量 |
 | 逐轮花费 | 同一行的 `cost` | 宿主自己算的，优先采信 |
+| 账本记账 | `tg sync` 从上面两行推导 | `in`=Σinput，`out`=Σ(output+reasoning)，`cache_read` 单列不入预算 |
 | 会话累计 | `session_v2` | 只用于"会话级命中率"，**绝不冒充单轮值** |
 | 价格表 | `opencode.json` 各 provider 的 `cost` | USD / 百万 token |
 | 窗口 | 模型 `limit.context` | 中转若虚标就对不上，会在 `ctx` 里显形 |
@@ -152,6 +194,21 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 
 含义很直接：**还没到要换手的时候，但按当前增速五十几轮后会到。** 这种"提前几十轮就知道"的信息，是压缩提示词给不了的。
 
+`tg sync` 在同一个宿主的另一个长会话上跑出的对账（714 轮，真实 `session_message` 逐轮数据）：
+
+```
+本次同步 714 轮
+新输入 2384.8k + 输出 360.5k（其中推理 215k）= 2960.3k tok
+缓存读 45495.4k / 写 0 —— 不计入预算
+钱：$0.276054（¥1.8466） · 宿主记录
+```
+
+两件事值得注意：**缓存读是新输入的 19 倍**——这个会话的账几乎全落在"重读已有上下文"上，
+所以省钱的着力点不是少写两行新输入，而是**让每轮要重读的前缀变短**（压缩），或者干脆
+**换个短前缀**（handoff）；**推理 token 占输出的 60%**——记账时漏掉它，钱就对不上。
+
+完整输出见 `examples/example-sync.txt`。
+
 ---
 
 ## 局限（诚实清单）
@@ -165,6 +222,12 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 7. 不接管模型路由：`--tier` 只是标签，真路由靠会话内切模型。
 8. 看板只读 + 采样，**不能从 UI 改计划**——写操作只走 CLI，才有 append-only 留痕。
 9. `.plan/` 与 schema 2 与上游 `plan-ledger` 共享，改格式会同时影响两者。
+10. `sync` 的归账是**按"谁在 doing"归的**：上次 sync 之后的所有轮次都算到当前那一步上。
+    宿主不知道你的步骤边界，所以**切步骤之前先 sync 一次**是你的事，不是工具的事。
+11. `sync` 读窗口是最新 2000 轮。更早的读不到，也就不计入；遇到超长会话时输出会明说，
+    别把那次结果当成"会话总共花了多少"（那看 `tg ctx` 的会话累计）。
+12. `sync` 只认带 `tokens` 的 assistant 消息。一轮里如果宿主没写 tokens，那轮就是漏记的，
+    账本只保证"与宿主记到的一致"，不保证"与真金白银一致"。
 
 ---
 
@@ -173,10 +236,11 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 ```bash
 python tests/test_tg.py        # 53 项：计划 / 门禁 / 预算口径 / 兼容
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
+python tests/test_sync.py      # 41 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错
 python tests/smoke_serve.py    # 14 项：真起服务、真打请求、Host 头校验
 ```
 
-全部离线可复现：`test_ctx.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **133 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 ---
 
