@@ -6,6 +6,7 @@
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -238,6 +239,50 @@ def main():
     check("自己的产物不算「别的步骤的东西」", "notes/01.md" not in sec7)
     check("「不在范围内」不留重复条目", sec7.count("`tg.py`") <= 1,
           "重复 %d 次" % sec7.count("`tg.py`"))
+
+    # ---------------- 断言超时：既不算通过，也不算破了 ----------------
+    # 狗粮实测：把「跑全部四套件」的检查写进断言，done / reconcile 每次都会重跑它，
+    # 一次吃掉两三分钟。以前超时被当 FAIL —— 好代码会被冤枉成回归，坏代码则可能被
+    # 一个「超时也算失败」的模糊印象糊过去。超时是**没结论**，得单独说。
+    with open(os.path.join(root, "slow.py"), "w", encoding="utf-8") as fh:
+        fh.write("import time\ntime.sleep(8)\n")
+    run(["add", "--title", "慢断言", "--out", "notes/08.md", "--depends", "1",
+         "--rounds", "2", "--reuse", "existing",
+         "--accept", "cmd:python slow.py"], root)
+    r = run(["gate", "8", "--timeout", "1"], root, expect=1, must="TIMEOUT")
+    check("超时标成 TIMEOUT（不冒充 FAIL）", "TIMEOUT" in (r.stdout or ""))
+    check("超时明说「没验完」", "没验完" in (r.stdout + r.stderr))
+    check("超时给放宽时间的命令", "--timeout" in (r.stdout + r.stderr))
+    r = run(["gate", "8", "--timeout", "0"], root, must="gate 通过")
+    check("--timeout 0 = 不限时，跑完就过", "exit=0" in (r.stdout or ""))
+    check("通过了也带耗时（谁在吃时间一眼看见）",
+          re.search(r"exit=0\s+\d+\.\d+s", r.stdout or "") is not None,
+          (r.stdout or "")[-200:])
+    r = run(["done", "8", "--timeout", "1"], root, expect=1, must="不能当通过")
+    check("超时时 done 拒绝标记完成", "不能当通过" in (r.stdout + r.stderr))
+    check("超时没被记成 done", step(root, 8)["status"] != "done",
+          repr(step(root, 8)["status"]))
+
+    # 判「没结论」和判「回归」是两件事：reconcile 里必须分开报
+    run(["done", "8", "--force", "--timeout", "1"], root)
+    r = run(["reconcile", "--timeout", "1"], root, expect=0, must="没验完")
+    check("reconcile 把超时报成「没结论」", "还没结论" in (r.stdout or "")
+          or "不知道还算不算通过" in (r.stdout or ""))
+    check("reconcile 明说超时不是回归", "不是回归" in (r.stdout or ""))
+    check("只有超时时 reconcile 不判失败（exit 0）", r.returncode == 0)
+
+    # 真回归：产物被删 → 报「现在不通过了」，并用非 0 退出（脚本能判）
+    with open(os.path.join(root, "notes", "09.md"), "w", encoding="utf-8") as fh:
+        fh.write("x\n")
+    run(["add", "--title", "有产物的步骤", "--out", "notes/09.md", "--depends", "1",
+         "--rounds", "2", "--reuse", "existing",
+         "--accept", "file:exists:notes/09.md"], root)
+    run(["gate", "9"], root, must="gate 通过")
+    run(["done", "9", "--timeout", "60"], root)
+    os.remove(os.path.join(root, "notes", "09.md"))
+    r = run(["reconcile", "--timeout", "60"], root, expect=1, must="现在不通过了")
+    check("真回归用非 0 退出", r.returncode == 1)
+    run(["reset", "9"], root)          # 复原，别影响后面那条「reconcile 可用」
 
     # ---------------- 收尾：reconcile 仍可用 ----------------
     r = run(["reconcile"], root, expect=0)

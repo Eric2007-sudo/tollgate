@@ -206,6 +206,35 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 
 ---
 
+## 门禁跑太久：超时是「没结论」，不是「破了」
+
+`cmd:` 断言就是个 shell 命令，所以有人（我自己）会把「跑全部四套件」这种**全仓检查**
+写进断言。它能过，但代价是 `done` / `reconcile` 每次都要重跑它——实测一次两分半起步，
+`reconcile` 6 个步骤要十分钟。于是有两条规矩：
+
+- **断言回答的是「这一步做完了吗」，不是「这个仓库还干净吗」**。全仓检查放在提交前，
+  当断言就会跟着每次 `done` 一起跑。
+- **超时不算失败，算没验完**。以前超时一律记 FAIL，一步好代码被跑慢冤枉成「回归」；
+  现在单独标 `TIMEOUT`、单独计数，`done` 拒绝标记完成（没验完就别算做完），
+  `reconcile` 报 `?? 有 N 条没验完（超时）：不知道还算不算通过`，并且**不判回归**：
+
+```text
+$ tg gate 1 --timeout 1
+[2026-10-25T18:35:14] gate #1 跑全仓检查
+  TIMEOUT  cmd:python slow.py
+      cmd 超时（1s 上限，已跑 5s）：没验完 —— 既不算通过，也不算破了。放宽时间用 tg gate --timeout N（0 = 不限时），python slow.py
+
+1 条断言超时没验完 —— 既不算通过也不算破了。放宽时间：tg gate 1 --timeout 0（不限时），或给个更大的秒数
+```
+
+（上面这条 `slow.py` 是演示脚本 `time.sleep(5)`，数字是真的；把断言换成
+`cmd:python tests/check_doc_counts.py` 形状完全一样，只是 5s 变 152s。）
+
+`tg gate / done / reconcile` 都有 `--timeout N`（默认 600 秒/条，`0` = 不限时）。另外每条
+`cmd:` 断言现在都会在输出里带**耗时**（`exit=0  5.1s`），谁在吃时间一眼看见，不用猜。
+
+---
+
 ## 本地工作台
 
 `tg serve` 起一个只绑 `127.0.0.1` 的只读看板（校验 Host 头，防 DNS rebinding），一屏看到：
@@ -289,6 +318,9 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
     游标很大：1020 条 id ≈ 39 KB。
 16. `plan.json` / `ledger.jsonl` 认 BOM（Windows 编辑器会加），但**只认 BOM**：手改 JSON 时
     结构写错、字段拼错，工具不会猜你的意思，该报错就报错。
+17. `reconcile` 会把**所有**已完成步骤的门禁重跑一遍，所以计划里的慢断言会成倍放大时间
+    （本仓 6 个步骤实测 352 秒，其中大半是两套全量测试）。它没有缓存、没有增量——「上次
+    验过」不算数，这正是不骗人的代价。要给慢断言放宽时间用 `--timeout N`（`0` = 不限时）。
 
 ---
 
@@ -301,7 +333,7 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 | `references/context-budget.md` | 计费公式、缓存命中、1.5× 换手结论、预算口径 vs 钱 |
 | `references/tiers.md` | 三档判据、模型 ID 映射、用账本里的真实单轮价验证档位是否生效 |
 | `references/handoff.md` | 简报怎么写、三种交付方式、换手与「回来」各自的钱 |
-| `references/anti-patterns.md` | 28 条真实失败模式（#20–#28 是闸二的口径坑与账本边界） |
+| `references/anti-patterns.md` | 29 条真实失败模式（#20–#28 是闸二的口径坑与账本边界，#29 是门禁把自己跑不完） |
 | `docs/dogfood.md` | 一次真实任务的战报：拿狗粮跑闭环撞出来的七个缺口，含真实账本数字 |
 
 ---
@@ -309,18 +341,18 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 ## 测试
 
 ```bash
-python tests/test_tg.py        # 76 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告
+python tests/test_tg.py        # 98 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 106 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界
 python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
 ```
 
-合计 **242 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **264 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面四个套件，核对 README 写的项目数与合计（不计入 242）
+python tests/check_doc_counts.py   # 真跑上面四个套件，核对 README 写的项目数与合计（不计入 264）
 ```
 
 ---

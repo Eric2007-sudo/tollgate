@@ -42,6 +42,15 @@ tollgate 0.3 新增：
                              下限可以补成接近真实总数，而且补多少次都不翻倍。
   看板同步游标口径             对账行按「正在看的这个会话」的游标算，不再拿别的会话的比。
 
+tollgate 0.4.1 修（狗粮收尾时补的最后一条）：
+  超时是「没验完」              以前 cmd: 断言超时一律算 FAIL —— 一步好代码因为跑得慢，
+                               会被 reconcile 报成「现在不通过了」，人去查一个不存在的回归。
+                               现在单独标 TIMEOUT、单独计数：done 拒绝标记完成（没验完
+                               就别算做完），reconcile 不判回归也不以非 0 退出（真回归才
+                               exit 1，脚本分得清）；gate/done/reconcile 都有 --timeout N。
+  断言耗时可见                  每条 cmd: 断言在输出里带耗时（exit=0  152.3s  ...），
+                               谁在吃时间一眼看见，不用猜是哪条拖的。
+
 tollgate 0.4 新增（拿真活跑闭环时自己撞出来的）：
   账本行带会话来源            sync 写的每笔记录都带 session；report 按会话分列，
                               没有会话 id 的旧行单独报一桶 —— 不替人猜「这笔钱是谁的」。
@@ -90,6 +99,11 @@ SCHEMA = 2
 # --rounds。所以拿它去和「一次请求的上下文」比大小是没有意义的——那也是 v0.4 修掉
 # 的一个误报（用户明明按轮数定了预算，还被骂 token 预算太小）。
 DEFAULT_BUDGET = 8000
+
+# 一条 `cmd:` 断言最多跑多久（秒）。超时不是「破了」也不是「通过」，是**没验完**：
+# 拿超时当 FAIL 会冤枉一步好代码，当 PASS 就是自欺。所以它单独报、单独算。
+GATE_TIMEOUT = 600
+TIMEOUT_TAG = "cmd 超时"
 
 TIERS = ("cheap", "std", "deep")
 
@@ -375,8 +389,11 @@ def parse_pair(expr, kind):
     return pattern, path
 
 
-def run_check(expr, root):
-    """返回 (passed, detail)。任何未知语法一律判失败，不静默放行。"""
+def run_check(expr, root, timeout=GATE_TIMEOUT):
+    """返回 (passed, detail)。任何未知语法一律判失败，不静默放行。
+
+    `timeout` 只对 `cmd:` 生效：超时返回「没验完」，不假装通过、也不冤枉代码。
+    """
     expr = expr.strip()
 
     if expr.startswith("file:exists:"):
@@ -405,14 +422,21 @@ def run_check(expr, root):
 
     if expr.startswith("cmd:"):
         cmd = expr[len("cmd:"):].strip()
+        t0 = time.monotonic()
         try:
-            r = subprocess.run(cmd, shell=True, cwd=str(root), timeout=600,
-                               capture_output=True)
+            r = subprocess.run(cmd, shell=True, cwd=str(root),
+                               timeout=(timeout or None), capture_output=True)
         except subprocess.TimeoutExpired:
-            return False, "cmd 超时: %s" % cmd
+            return False, "%s（%ds 上限，已跑 %.0fs）：没验完 —— 既不算通过，也不算破了。" \
+                          "放宽时间用 tg gate --timeout N（0 = 不限时），%s" % (
+                              TIMEOUT_TAG, timeout, time.monotonic() - t0, cmd)
+        spent = time.monotonic() - t0
         ok = (r.returncode == 0)
         tail = (r.stdout + r.stderr).decode("utf-8", "replace").strip().splitlines()
-        return ok, "exit=%d  %s" % (r.returncode, (tail[-1] if tail else ""))
+        detail = "exit=%d  %.1fs" % (r.returncode, spent)
+        if tail:
+            detail += "  " + tail[-1]
+        return ok, detail
 
     if expr.startswith("ack:"):
         return False, '需人工确认（tg ack "<该项原文>"）'
@@ -420,26 +444,39 @@ def run_check(expr, root):
     return False, "无法识别的断言语法: %s" % expr
 
 
-def run_gates(root, step, plan):
+def run_gates(root, step, plan, timeout=GATE_TIMEOUT):
     acks = set(plan.get("acks", []))
     results = []
     for expr in step.get("accept", []):
         if expr.startswith("ack:") and expr in acks:
             results.append((expr, True, "人工已确认"))
             continue
-        ok, detail = run_check(expr, root)
+        ok, detail = run_check(expr, root, timeout)
         results.append((expr, ok, detail))
     return results
 
 
-def gate_report(root, step, plan, log=True):
-    results = run_gates(root, step, plan)
+def is_timeout(detail):
+    return detail.startswith(TIMEOUT_TAG)
+
+
+def gate_report(root, step, plan, log=True, timeout=GATE_TIMEOUT):
+    """跑完这一段的断言。返回 (results, failed_n, timed_n, text)。
+
+    `failed_n` 只数**确定破了**的；超时的单独数在 `timed_n` ——
+    它的意思不是「代码错」，而是「这一条没验完，谁也说不准」。
+    """
+    results = run_gates(root, step, plan, timeout)
     lines = ["[%s] gate #%d %s" % (now_iso(), step["n"], step["title"])]
-    failed = 0
+    failed = timed = 0
     for expr, ok, detail in results:
-        lines.append("  %s  %s\n      %s" % ("PASS" if ok else "FAIL", expr, detail))
+        tag = "PASS" if ok else ("TIMEOUT" if is_timeout(detail) else "FAIL")
+        lines.append("  %s  %s\n      %s" % (tag, expr, detail))
         if not ok:
-            failed += 1
+            if is_timeout(detail):
+                timed += 1
+            else:
+                failed += 1
     if not results:
         lines.append("  (无断言 → 自动通过，但这步没有验证价值)")
     if log:
@@ -447,7 +484,7 @@ def gate_report(root, step, plan, log=True):
         p["dir"].mkdir(parents=True, exist_ok=True)
         with open(p["gates"], "a", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
-    return results, failed, "\n".join(lines)
+    return results, failed, timed, "\n".join(lines)
 
 
 # ---------------------------------------------------------------- 命令
@@ -922,7 +959,7 @@ def cmd_gate(a):
                 sys.exit(0)
             s = todos[0]
 
-    results, failed, text = gate_report(root, s, plan)
+    results, failed, timed, text = gate_report(root, s, plan, timeout=a.timeout)
     out(text)
 
     drift = git_drift(root, plan.get("git_head"))
@@ -930,9 +967,14 @@ def cmd_gate(a):
         warn("工作树已比基线 commit `%s` 前进 %d 个 commit。"
              "如果计划写在旧代码上，先核对这一步的前提还成立吗。" % (plan["git_head"], drift))
 
-    if failed:
+    if failed or timed:
         out("")
-        out("gate 失败 %d 条。修完再跑，不要 tg done。" % failed)
+        if failed:
+            out("gate 失败 %d 条。修完再跑，不要 tg done。" % failed)
+        if timed:
+            out("%d 条断言超时没验完 —— 既不算通过也不算破了。"
+                "放宽时间：tg gate %d --timeout 0（不限时），或给个更大的秒数"
+                % (timed, s["n"]))
         sys.exit(1)
     out("")
     out("gate 通过 %d 条。" % len(results))
@@ -942,13 +984,18 @@ def cmd_done(a):
     root = find_root()
     plan = load(root)
     s = step_by_n(plan, a.n)
-    results, failed_n, text = gate_report(root, s, plan)
+    results, failed_n, timed_n, text = gate_report(root, s, plan, timeout=a.timeout)
     failed = [(e, d) for (e, ok, d) in results if not ok]
     if failed and not a.force:
         out("拒绝标记完成：gate 未通过")
         for e, d in failed:
-            out("  FAIL  %s   (%s)" % (e, d))
+            tag = "TIMEOUT" if is_timeout(d) else "FAIL"
+            out("  %s  %s   (%s)" % (tag, e, d))
         out("")
+        if timed_n:
+            out("其中 %d 条是超时：它们没验完，不能当通过。"
+                "放宽时间再跑：tg gate %d --timeout 0（不限时）"
+                % (timed_n, s["n"]))
         out("要么修到通过，要么显式 tg done %d --force（会记进 ledger）" % a.n)
         sys.exit(1)
     s["status"] = "done"
@@ -1265,18 +1312,31 @@ def cmd_reconcile(a):
     if not done:
         out("没有已完成步骤可核验。")
     broke = []
+    unsure = []
     for s in done:
-        results, failed_n, _ = gate_report(root, s, plan, log=False)
+        results, failed_n, timed_n, _ = gate_report(root, s, plan, log=False,
+                                                    timeout=a.timeout)
         if failed_n:
-            broke.append((s, [r for r in results if not r[1]]))
+            broke.append((s, [r for r in results if not r[1] and not is_timeout(r[2])]))
+        if timed_n:
+            unsure.append((s, [r for r in results if not r[1] and is_timeout(r[2])]))
     if done:
         out("核验了 %d 个已完成步骤：" % len(done))
-        if not broke:
+        if not broke and not unsure:
             out("  全部仍然通过。")
         for s, fails in broke:
             out("  !! #%d %s 现在不通过了：" % (s["n"], s["title"]))
             for expr, _ok, detail in fails[:3]:
                 out("       %s   (%s)" % (expr, detail[:90]))
+        for s, unsure_items in unsure:
+            out("  ?? #%d %s 有 %d 条没验完（超时）：不知道还算不算通过"
+                % (s["n"], s["title"], len(unsure_items)))
+            for expr, _ok, _detail in unsure_items[:3]:
+                out("       %s" % expr)
+        if unsure:
+            out("")
+            out("超时的那些不是回归，是**没结论**。给它们更多时间："
+                "tg reconcile --timeout 0（不限时）")
     blocked = [s for s in plan["steps"] if s["status"] == "blocked"]
     if blocked:
         out("")
@@ -1292,6 +1352,7 @@ def cmd_reconcile(a):
     if broke:
         out("")
         out("回归步骤用 tg reset N 退回 todo 重做。")
+        sys.exit(1)
 
 
 def cmd_report(a):
@@ -2719,7 +2780,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="tg", description="tollgate：agent 的过闸 —— 计划预算 · 上下文预算 · 本地账本")
     ap.add_argument("-V", "--version", action="version",
-                    version="tollgate 0.4（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
+                    version="tollgate 0.4.1（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="建立 .plan/")
@@ -2817,11 +2878,16 @@ def main():
 
     p = sub.add_parser("gate", help="跑验收断言")
     p.add_argument("n", type=int, nargs="?", default=None)
+    p.add_argument("--timeout", type=int, default=GATE_TIMEOUT,
+                   help="每条 cmd: 断言最多跑几秒（超时算「没验完」，不算通过；0 = 不限时；默认 %d）"
+                        % GATE_TIMEOUT)
     p.set_defaults(fn=cmd_gate)
 
     p = sub.add_parser("done", help="标记完成（gate 不通过会拒绝）")
     p.add_argument("n", type=int)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--timeout", type=int, default=GATE_TIMEOUT,
+                   help="每条 cmd: 断言最多跑几秒（0 = 不限时；默认 %d）" % GATE_TIMEOUT)
     p.set_defaults(fn=cmd_done)
 
     p = sub.add_parser("handoff", help="为便宜模型生成自足式任务简报")
@@ -2830,6 +2896,9 @@ def main():
     p.set_defaults(fn=cmd_handoff)
 
     p = sub.add_parser("reconcile", help="重跑已完成步骤的门禁，找回归")
+    p.add_argument("--timeout", type=int, default=GATE_TIMEOUT,
+                   help="每条 cmd: 断言最多跑几秒（0 = 不限时；默认 %d；全仓检查类断言要放宽）"
+                        % GATE_TIMEOUT)
     p.set_defaults(fn=cmd_reconcile)
 
     p = sub.add_parser("report", help="成本 / 预算准确性 / 复用率报表")

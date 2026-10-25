@@ -62,7 +62,7 @@
 
 ### 3. 修复本身在真机上崩了（测试没覆盖那条路径）
 
-改完代码、测试全绿（95 项），真机 `tg sync` 却抛栈：
+改完代码、四套测试全绿，真机 `tg sync` 却抛栈：
 
 ```text
   File "tg.py", line 2441, in cmd_sync
@@ -103,11 +103,28 @@ $ tg add --title ... --rounds 20 --out docs/
 `test_sync.py`（40 秒）+ `check_doc_counts.py`（它自己再把四个套件全跑一遍）。
 实测一次 `done` 超过 2 分钟，直接把我的命令超时打爆。收尾时 `tg reconcile` 更狠——
 它要把**所有**已完成步骤的门禁重跑一遍，这一轮 6 个步骤里有 2 条断言要跑全量测试，
-180 秒超时被打断（不是挂，是真在跑）。给 `reconcile` 至少留 10 分钟。
+180 秒超时被打断（不是挂，是真在跑）。当时给的结论是「给 `reconcile` 至少留 10 分钟」，
+后来实测连 900 秒都不够。
 
 这不是 bug，是设计没想清楚：**文档核对器是"提交前"的检查，不是"这一步做完了"的检查**。
-现在的建议是把它留在 `tg gate` 之外的收尾清单里；真要放断言，就接受 `done` 变慢，
-并在 `--stop` 里写明原因。（这一轮没改代码，先记下来。）
+收尾时按这个思路改掉两条（0.4.1）：
+
+- **超时不再算 FAIL**，单独标 `TIMEOUT`：`done` 照样拒绝（没验完就别算做完），但
+  `reconcile` **不判回归、也不以非 0 退出**，只报 `?? 有 N 条没验完（超时）：不知道还算
+  不算通过`。以前超时一律记 FAIL，一步好代码因为跑得慢被报成"现在不通过了"，人会去查
+  一个根本不存在的回归——**超时是没结论，不是破窗**。
+- **每条 `cmd:` 断言带耗时**，且 `gate` / `done` / `reconcile` 都能 `--timeout N`
+  （`0` = 不限时）。慢断言留不留由你定，但不用再猜是哪一条在拖时间。
+
+规矩写进了 `references/gates.md`：断言回答「**这一步**做完了吗」，全仓检查放提交前；
+凑成反模式 #29。
+
+**规矩先拿自己的计划开刀**：这个狗粮计划里有 4 条断言在跑整套文档核对（#3 #4 #6 各一条，
+`test_sync` 那两条也算全量）。真机实测：改之前 `tg reconcile` 跑 900 秒还没完，被我自己的
+超时打死，连输出都没留下；把 #3 #4 的两条全仓检查移走（`tg amend 3 --force --rm-accept …`，
+ledger 里留了 `amend` + `forced` 记录，改动可审计）、只在 #6 收尾保留一条之后，
+**同一条命令 352 秒跑完，全部仍然通过**。剩下的时间主要花在 `test_sync.py` / `test_tg.py`
+上——那两条是这个项目的正当断言（这一步的产物就是代码和测试），不算滥用。
 
 ### 6. 「跳过多少钱」会被读成「漏了多少钱」（写战报时才发现的）
 
@@ -210,11 +227,13 @@ $ tg sync
 - 代码：`sync` 行带 `session`；`cost_by_session()`；`report` 按会话分列；
   `ts_ms()` / `sync_boundary()` / `boundary_payload()` / `skipped_payload()` / `skipped_lines()`；
   `start` 写 `started_ms`、`reset` 清、`sync` 按边界过滤；`--budget` / `--reuse` 的假警告；
-  `handoff` 简报不再把这一步自己的产物列成「范围外」、去重、档位措辞按级数算。
-- 测试：196 → 242 项（`test_sync.py` 74 → 106，`test_tg.py` 65 → 76，其余不变）。
+  `handoff` 简报不再把这一步自己的产物列成「范围外」、去重、档位措辞按级数算；
+  `run_check(..., timeout=)` / `is_timeout()`、`gate` / `done` / `reconcile` 的 `--timeout` 与
+  `TIMEOUT` 结果分类、每条 `cmd:` 断言输出耗时。
+- 测试：196 → 264 项（`test_sync.py` 74 → 106，`test_tg.py` 65 → 98，其余不变）。
 - 文档：`README.md` 口径与实测样本、`references/plan-format.md`（`started_ms` 与 `boundary`）、
-  `references/anti-patterns.md` #28、`docs/architecture.md`（`sync` 数据流加边界）、
-  这份战报。
+  `references/anti-patterns.md` #28 与 #29、`references/gates.md`（超时语义 + 别把全仓检查
+  写进断言）、`docs/architecture.md`（`sync` 数据流加边界）、这份战报。
 
 ## 结论
 
