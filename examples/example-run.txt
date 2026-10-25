@@ -1,7 +1,9 @@
-﻿# 闸一实操记录 —— 由 tg.py 真实执行产生，非手写
+# 闸一实操记录 —— 由 tg.py 真实执行产生，非手写
+#
+# 脱敏说明：本机绝对路径已改写成 <工作目录>（共 4 处），**数字与文案一个字没动**。
 
 $ tg init "把 pipeline.py 拆成可测模块" --why "现在改一处要跑全量，改动无法验证"
-已建立计划 `440ecb` → C:\Users\<user>\AppData\Local\Temp\tg_demo\.plan
+已建立计划 `440ecb` → <工作目录>\.plan
 下一步：tg add --title "..." --tier cheap --budget 8000 --out notes/01-x.md --reuse existing --accept "file:exists:notes/01-x.md"
 
 $ tg add #1（复用梯子第 3 级：标准库已有 io）
@@ -32,7 +34,7 @@ $ tg spend 1 --in 12000 --out 900 --reqs 1
 $ tg gate 1        # 还没写产物：断言必须拦住
 [2026-10-25T13:25:35] gate #1 抽出 io 层
   FAIL  file:exists:src/io.py
-      exists -> C:\Users\<user>\AppData\Local\Temp\tg_demo\src\io.py
+      exists -> <工作目录>\src\io.py
   FAIL  cmd:python -m py_compile src/io.py
       exit=1  [Errno 2] No such file or directory: 'src/io.py'
 
@@ -40,7 +42,7 @@ gate 失败 2 条。修完再跑，不要 tg done。
 
 $ tg done 1        # 门禁没过 → 拒绝完成
 拒绝标记完成：gate 未通过
-  FAIL  file:exists:src/io.py   (exists -> C:\Users\<user>\AppData\Local\Temp\tg_demo\src\io.py)
+  FAIL  file:exists:src/io.py   (exists -> <工作目录>\src\io.py)
   FAIL  cmd:python -m py_compile src/io.py   (exit=1  [Errno 2] No such file or directory: 'src/io.py')
 
 要么修到通过，要么显式 tg done 1 --force（会记进 ledger）
@@ -48,7 +50,7 @@ $ tg done 1        # 门禁没过 → 拒绝完成
 $ tg gate 1        # 产物到位：断言放行
 [2026-10-25T13:25:36] gate #1 抽出 io 层
   PASS  file:exists:src/io.py
-      exists -> C:\Users\<user>\AppData\Local\Temp\tg_demo\src\io.py
+      exists -> <工作目录>\src\io.py
   PASS  cmd:python -m py_compile src/io.py
       exit=0  
 
