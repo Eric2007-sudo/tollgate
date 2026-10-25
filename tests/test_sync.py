@@ -309,6 +309,27 @@ def main():
     expect("第 40 轮上下文" not in body, "不再把「读到的第 40 条」谎报成「第 40 轮」")
     expect("最近 40 轮" in body, "改成说清「这里只看最近 40 轮」")
 
+    # ---------- 16. init --force 清账本但不清游标：既不重记也不补记 ----------
+    # 这条是 references/anti-patterns.md #24 与 plan-format.md「删文件前先看这张表」
+    # 里写下的承诺，所以必须被钉死：init --force 只 unlink ledger 与 gates，
+    # sync.json 留着，于是新账本从「游标之后」开始记。
+    tmp13 = case("16 force 重建计划", TURNS3)
+    run(tmp13, ["sync"])
+    before = sync_state(tmp13).get("ids") or []
+    expect(len(before) == 3, "先同步出 3 条游标（实际 %d）" % len(before))
+    run(tmp13, ["init", "换个目标", "--force"])
+    run(tmp13, ["add", "--title", "新活", "--out", "out/b.txt",
+                "--budget", "100000", "--rounds", "10"])
+    run(tmp13, ["start", "1"])
+    expect(not os.path.isfile(os.path.join(tmp13, ".plan", "ledger.jsonl")),
+           "init --force 清掉了 ledger.jsonl")
+    expect(len(sync_state(tmp13).get("ids") or []) == 3,
+           "但游标原样保留（3 条 id）")
+    d2 = run_json(tmp13, ["sync"])
+    expect(d2 is not None and d2.get("fresh") == 0,
+           "重建后 sync 不重记已入账的轮次（实际 %s）" % (d2 or {}).get("fresh"))
+    expect(ledger(tmp13) == [], "新账本没有被旧轮次污染")
+
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:
         print("  - " + m)

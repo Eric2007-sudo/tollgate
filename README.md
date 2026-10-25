@@ -242,16 +242,29 @@ usd = (input×p_in + (output + reasoning)×p_out + cache_read×p_cr + cache_writ
 
 ---
 
+## 深入文档（六份，按需读）
+
+| 文件 | 讲什么 |
+|---|---|
+| `references/gates.md` | 两道闸的守卫点、断言语法、门禁为什么拒 |
+| `references/plan-format.md` | 计划 / 账本 / 游标的字段级格式；删 `.plan/` 里哪个文件会出什么事 |
+| `references/context-budget.md` | 计费公式、缓存命中、1.5× 换手结论、预算口径 vs 钱 |
+| `references/tiers.md` | 三档判据、模型 ID 映射、用账本里的真实单轮价验证档位是否生效 |
+| `references/handoff.md` | 简报怎么写、三种交付方式、换手与「回来」各自的钱 |
+| `references/anti-patterns.md` | 25 条真实失败模式（#20–#25 是闸二的六个口径坑） |
+
+---
+
 ## 测试
 
 ```bash
 python tests/test_tg.py        # 53 项：计划 / 门禁 / 预算口径 / 兼容
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
-python tests/test_sync.py      # 53 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报
+python tests/test_sync.py      # 58 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建
 python tests/smoke_serve.py    # 29 项：真起服务、真打请求、Host 头校验、钱与对账上屏
 ```
 
-合计 **160 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **165 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 

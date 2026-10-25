@@ -7,6 +7,8 @@
   plan.json      ← 唯一真相。CLI 读写，不要手改
   plan.md        ← 渲染视图。人看、模型按需读。每次改动自动重写
   ledger.jsonl   ← 追加写。一行一笔 token 消耗，永不改写
+  sync.json      ← 对账游标：哪些轮次已经记进账本了（sync 专用）
+  ctx.jsonl      ← 采样历史（宿主读不到逐轮数据时的兜底口径，见 context-budget.md）
   gates.log      ← 每次 gate 的历史
   notes/         ← 每步的产物（纯分析步骤的交付物）
   brief/         ← handoff 生成的、给便宜模型的自足简报
@@ -14,6 +16,9 @@
 
 **规则**：要改计划，用 `tg` 改；不要手写 `plan.json`。
 `plan.md` 是生成物，手改会在下次渲染时被覆盖。
+
+`sync.json` 和 `ledger.jsonl` 是一对：**账本记「记了什么」，游标记「记到哪了」**。
+只删其中一个会出事，见下面的「删文件前先看这张表」。
 
 ---
 
@@ -77,7 +82,7 @@
 | `why` | 这个任务为什么该存在。空的会在 `drift` 里被点出来 | `init --why` |
 | `git_head` | 建计划时的 `git rev-parse --short HEAD`。用于漂移检查 | `init` |
 | `max_rounds` | 单步重试上限。`start` 到顶会强制 block，防死循环烧钱 | `init --max-rounds` |
-| `baseline_context` | 本会话一次请求的典型上下文 token 数。有它 `report` 才能把轮数折算成钱；0 = 未设 | `init --baseline-context` / `amend 0` |
+| `baseline_context` | 一次请求的典型上下文 token 数。**兜底用**：`sync` 读不到宿主逐轮数据时，`report` 才拿它把轮数折算成钱；0 = 未设 | `init --baseline-context` / `amend 0` |
 | `exclude` | 禁读清单 | `init --exclude` / `exclude` |
 | `acks` | 已确认的 `ack:` 断言 | `ack` |
 | `steps[].n` | 序号，从 1 开始，自动分配 | `add` |
@@ -134,15 +139,44 @@ tg amend 0 --add-exclude "data/*.json" --max-rounds 2
 {"ts": "2026-10-25T11:29:21", "step": 1, "in": 0, "out": 0, "note": "DONE"}
 {"ts": "2026-10-25T11:31:02", "step": 2, "in": 8400, "out": 1200, "reqs": 2, "note": "第一版 tsc 报错"}
 {"ts": "2026-10-25T11:33:40", "step": 2, "in": 0, "out": 0, "amend": {"accept": [["file:exists:src/auth/jwt.ts"], ["file:exists:src/auth/jwt.ts", "cmd:npx tsc --noEmit"]]}, "forced": false, "note": "忘了类型检查"}
+{"ts": "2026-10-25T14:22:07", "step": 1, "in": 2384800, "out": 575500, "reqs": 714, "cache_read": 45495400, "src": "opencode.db", "cost": 0.276054, "note": "sync 自动对账（714 轮）"}
 ```
 
-三类行，同一张表：
+四类行，同一张表：
 
 | 行型 | 必有的键 | 含义 |
 |---|---|---|
-| 记账 | `in` / `out` | 一笔 token 消耗。`reqs` 可选但强烈建议（几轮请求） |
+| 手记 | `in` / `out` | 一笔 token 消耗。`reqs` 可选但强烈建议（几轮请求） |
+| 对账 | `in` / `out` / `reqs` / `src` | 同上，但由 `sync` 从宿主库里读出来后写入。见下方字段表 |
 | 完成 | `note: "DONE"` | 这一步收尾了。`(forced)` 后缀表示绕过了门禁 |
 | 改动 | `amend` / `forced` | 计划被改：字段 → [旧值, 新值]。`forced: true` = 动了 done 步骤 |
+
+### `sync` 写的那行，字段比手记多
+
+| 字段 | 含义 |
+|---|---|
+| `in` | Σ 新输入 token（托管商真收钱的那部分） |
+| `out` | Σ (`output` + `reasoning`)。**推理 token 折进 `out`**，因为它是按输出价计费的 |
+| `reqs` | 这一段对账覆盖的轮数 |
+| `cache_read` / `cache_write` | 缓存命中 / 写入的 token。**只存档，不参与预算求和** |
+| `src` | 数据来源。目前只有 `opencode.db`——看到它就说明这行不是人手写的 |
+| `cost` | 宿主记的真实美元金额（逐轮 `cost` 之和） |
+| `cost_est` | 仅当宿主没记 `cost`、改用本地价目重算时出现。**它标的是「上界」**，不是账单 |
+| `note` | `sync 自动对账（N 轮）`。N 与 `reqs` 相等；不等就说明有人改过账本 |
+
+为什么要单列 `cache_read` 而不是并进 `in`：命中缓存的重读价是输入价的 1/50（本机中转实测），
+把它并进预算求和，会让每一步看起来都超预算 19 倍（实测 714 轮会话里 `cache_read` 是新输入的 19.08 倍），
+于是你会去治「上下文太大」这个假病，而真正该改的是轮数。**预算看 `in + out`，钱看 `cost`。**
+
+### 删文件前先看这张表
+
+| 删了 | 后果 |
+|---|---|
+| `plan.json` | 全部进度、断言、预算消失。`ledger.jsonl` 还在，但已经没有步骤可以归账 |
+| `ledger.jsonl` | 历史消耗消失。不致命，但「这个任务花了多少钱」永久丢失（宿主库里只有会话累计，没有按步骤的） |
+| `sync.json`（**只删它**） | 危险：下次 `sync` 认为窗口内 2000 轮全是新的，把同一批 token **再记一遍**，钱和预算双计 |
+| `tg init --force`（不是删文件，但常被当成删） | 只清 `ledger.jsonl` 与 `gates.log`，**不动 `sync.json`**。于是新账本从「游标之后」开始记：旧轮次不重记、也不补记。想彻底归零就删整个 `.plan/` |
+| 整个 `.plan/` | 干净重来。`tg init` 会全新建，这是唯一不留下脏数据的删法 |
 
 `amend` 行不记 token（`in`/`out` 都是 0），它只是留痕：谁在什么时候把哪条断言从什么改成了什么，
 以及为什么（`note`）。这样「预算超了之后偷偷改小预算」和「断言写错了补一条」在日志里长得不一样。
@@ -204,31 +238,35 @@ tg add --title "侦察：X 在哪里被使用" --tier cheap --budget 6000 \
 ## 完整例子
 
 ```bash
-PL init "把 auth 从 session 迁到 JWT" --exclude "node_modules/" "dist/" "*.lock"
+tg init "把 auth 从 session 迁到 JWT" --why "旧 session 表要下线" \
+        --exclude "node_modules/" "dist/" "*.lock"
 
-PL add --title "侦察：session 的所有落点" --tier cheap --budget 6000 \
+tg add --title "侦察：session 的所有落点" --tier cheap --budget 6000 --rounds 3 \
    --out notes/01-recon.md \
    --accept "file:exists:notes/01-recon.md"
 
-PL add --title "写签发与校验函数" --tier std --budget 14000 \
+tg add --title "写签发与校验函数" --tier std --budget 14000 --rounds 6 \
    --read "src/auth/session.ts" \
    --out src/auth/jwt.ts \
    --accept "file:exists:src/auth/jwt.ts" \
    --accept "cmd:npx tsc --noEmit"
 
-PL add --title "设计迁移方案（读 notes 后决策）" --tier deep --budget 10000 \
+tg add --title "设计迁移方案（读 notes 后决策）" --tier deep --budget 10000 --rounds 4 \
    --read "notes/01-recon.md" \
    --out notes/03-plan.md \
    --accept "file:exists:notes/03-plan.md"
 
-PL add --title "接中间件并删旧逻辑" --tier std --budget 16000 \
+tg add --title "接中间件并删旧逻辑" --tier std --budget 16000 --rounds 8 \
    --out src/middleware/auth.ts \
    --accept "nogrep:getSessionServerSide@src/middleware/auth.ts" \
    --accept "file:absent:src/auth/session.ts" \
    --accept "cmd:npm test"
 
-PL status
+tg status
 ```
+
+注意 `--budget` 和 `--rounds` 都写了：**轮数是预算口径**（数量级估得准），token 数是探测器
+（一次重构实测能差 74 倍）。两个都写，`report` 才分得清「是轮数超了还是上下文膨胀了」。
 
 对应状态摘要：
 
@@ -238,7 +276,7 @@ PL status
 当前: #1 侦察：session 的所有落点 (tier=cheap, 预算 6k)
 产物: notes/01-recon.md
 禁读: node_modules/、dist/、*.lock
-提示: tg show 看全文 · tg gate 验收 · 完成必须 gate 通过
+提示: tg show 看全文 · tg handoff N 发给便宜模型 · 完成必须 gate 通过
 ```
 
 ---
