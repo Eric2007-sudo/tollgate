@@ -52,7 +52,7 @@
 | **价格与账本** | `opencode_config` / `load_prices` / `opencode_db` / `read_sessions` / `current_session` / `cost_usd` |
 | **逐轮数据** | `read_turns`（解析消息里的 `tokens`）/ `growth_rate`（中位数增速） |
 | **上下文报告** | `ctx_report`（唯一的口径聚合点）/ `cmd_ctx` / `cmd_price` |
-| **两闸交界** | `load_cursors` / `save_cursors`（按会话分开的游标，v1 读时自动升级）/ `cmd_sync`（把逐轮用量写进账本） |
+| **两闸交界** | `load_cursors` / `save_cursors`（按会话分开的游标，v1 读时自动升级）/ `sync_boundary`（这一步从什么时候开始算）/ `cmd_sync`（把逐轮用量写进账本） |
 | **工作台** | `state_payload`（把上面全部打包成 JSON）/ `_make_handler` / `cmd_serve` |
 | 入口 | argparse，25 个子命令 |
 
@@ -96,20 +96,23 @@ current_session()            挑会话（同 ctx）
       ├── load_cursors()    读 .plan/sync.json：**这个会话**已入账的 id 集合
       │                     （别的会话的游标原样留着，不动）
       │
+      ├── sync_boundary()   归账边界：这步的 started_ms → 计划 created → 不知道
+      │
       ├── read_turns(sid)    最新 2000 轮，逐轮 tokens + cost
       │        │
-      │        └── 过滤掉已在游标里的 → fresh[]
+      │        ├── 早于边界的轮次 → skipped[]（同样报出来，不进账本也不进游标）
+      │        └── 边界之后的，过滤掉已在游标里的 → fresh[]
       │                 │
       │                 ├── in  = Σ input
       │                 ├── out = Σ (output + reasoning)
       │                 ├── reqs= len(fresh)
       │                 └── cost= Σ cost   （为 0 时按 load_prices 重算，标 cost_est）
       │
-      ├── append_ledger()    写一笔 {step, in, out, reqs, cache_read, cost, src}
+      ├── append_ledger()    写一笔 {step, in, out, reqs, cache_read, cost, src, session}
       └── save_cursors()     这个会话的游标前移（上限 2000 条），其它会话不动
 ```
 
-三个设计决定：
+五个设计决定：
 
 1. **口径不新开**：`sync` 写的就是 `spend` 那个格式，`spent_for()` / `reqs_for()` 一行都不用改。
    缓存读单列存进记录但不参与求和——预算口径是"新 token"，缓存命中只是重读。
@@ -120,6 +123,9 @@ current_session()            挑会话（同 ctx）
 4. **游标按会话分开**：一次 `sync` 只处理一个会话，但每个会话各留一份已入账 id。
    曾经只有一份扁平游标、换会话就清空，于是 A→B→A 会把 A 整段重记（实测 4 轮 /
    $0.0011 记成 7 轮 / $0.0014）。会话是几根并行的计数器，不是一根。
+5. **归账要划边界**：读窗口（最近 2000 轮）比"这一步"大得多，整段算给当前步就是错的归属
+   （真机实测：计划刚建立，第 1 步吃下整段对话 1102 轮 / $0.486120）。`tg start` 写
+   `steps[].started_ms` 当边界，被挡的轮次报出来但不入账；边界未知时明说不知道。
 
 ## 工作台为什么是静态页
 
@@ -137,7 +143,7 @@ current_session()            挑会话（同 ctx）
 
 | 块 | 内容 | 诚实处理 |
 |---|---|---|
-| `money` | 账本里真实记过的 `cost` 求和、笔数、轮数、单轮均价、宿主累计、**同期别的会话花了多少**（`other_sessions` / `other_usd`） | 一笔 cost 都没有时 `ledger_usd = null`，前端显示「没有」并指路 `tg sync`；没有别的会话时 `other_usd = null`，卡片不出现 |
+| `money` | 账本里真实记过的 `cost` 求和、笔数、轮数、单轮均价、宿主累计、**同期别的会话花了多少**（`other_sessions` / `other_usd`）、**钱按会话分列**（`by_session`：`session` / `usd` / `rows` / `reqs`，没会话 id 的旧行 `session` 为空串） | 一笔 cost 都没有时 `ledger_usd = null`，前端显示「没有」并指路 `tg sync`；没有别的会话时 `other_usd = null`，卡片不出现 |
 | `sync` | **正在看的那个会话**的游标状态（`synced_ids` / `same_session` / `updated`，`last_session` 是最后一次 sync 的会话）、账本里一共记过几个会话（`sessions`）、窗口内未入账轮数 | 未入账数只算**手上这 40 轮窗口**，而且只跟**这个会话**的游标比——拿别的会话的游标比会直接算错 |
 
 `money` 是**快照**：账本记的是上次 `sync` 那一刻的数，宿主累计一直在涨。两者差值 ≈ 上次对账

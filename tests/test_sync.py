@@ -42,12 +42,28 @@ def make_config(path, context=128000):
         json.dump(cfg, fh)
 
 
-def make_db(path, turns, sid="ses_test", model=MODEL):
+def now_ms():
+    """夹具里的轮次时间戳必须用「刚刚」，不能用 100 / 200 这种小整数。
+
+    `tg sync` 会按「这一步开始的时刻」划归账边界（`started_ms`），秒级小整数会被
+    归一成 1970 年，于是每一轮都落在边界之前、全被跳过 —— 那样测的就不是对账了。
+    """
+    return int(time.time() * 1000)
+
+
+def iso_ms(ms):
+    """epoch 毫秒 → 计划里 `created` 那种秒精度时间串（夹具要用）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ms / 1000.0))
+
+
+def make_db(path, turns, sid="ses_test", model=MODEL, t0=None):
     """turns: [(input, cache_read, output, reasoning, cost), ...] 时间升序。
 
     每条消息的 id 是 msg_000 / msg_001 …，重写库时 id 保持稳定 —— 这正是测
     「游标不重复记账」需要的前提。
     """
+    if t0 is None:
+        t0 = now_ms()
     if os.path.isfile(path):
         os.remove(path)
     con = sqlite3.connect(path)
@@ -65,37 +81,46 @@ def make_db(path, turns, sid="ses_test", model=MODEL):
         (sid, json.dumps({"id": model[1], "providerID": model[0]}),
          sum(t[4] for t in turns), sum(t[0] for t in turns),
          sum(t[2] for t in turns), sum(t[3] for t in turns),
-         sum(t[1] for t in turns), 0, 1, 1000))
+         sum(t[1] for t in turns), 0, t0 - len(turns) * 1000, t0))
     for i, (tin, tcr, tout, trea, cost) in enumerate(turns):
         data = {"model": {"id": model[1], "providerID": model[0]},
                 "tokens": {"input": tin, "output": tout, "reasoning": trea,
                            "cache": {"read": tcr, "write": 0}},
                 "cost": cost}
+        # 时间戳都落在「刚刚」之前（每秒一轮），不能有「未来」的轮次：
+        # 否则把边界挪到当下的用例会漏掉它们，测的就不是边界了。
+        ts = t0 - (len(turns) - 1 - i) * 1000
         con.execute(
             "insert into session_message values (?,?,?,?,?,?,?)",
-            ("msg_%03d" % i, sid, "assistant", i, 100 + i, 100 + i,
+            ("msg_%03d" % i, sid, "assistant", i, ts, ts,
              json.dumps(data)))
     con.commit()
     con.close()
 
 
-def add_session(path, sid, turns, prefix="msgB"):
-    """往同一个库里再塞一个会话。make_db 会删库，所以测多会话得自己加。"""
+def add_session(path, sid, turns, prefix="msgB", t0=None):
+    """往同一个库里再塞一个会话。make_db 会删库，所以测多会话得自己加。
+
+    t0 默认「刚刚」：轮次必须落在这一步开始之后，否则会被归账边界挡住。
+    """
+    if t0 is None:
+        t0 = now_ms()
     con = sqlite3.connect(path)
     con.execute(
         "insert into session_v2 values (?,?,?,?,?,?,?,?,?,?)",
         (sid, json.dumps({"id": MODEL[1], "providerID": MODEL[0]}),
          sum(t[4] for t in turns), sum(t[0] for t in turns),
          sum(t[2] for t in turns), sum(t[3] for t in turns),
-         sum(t[1] for t in turns), 0, 2000, 2000))
+         sum(t[1] for t in turns), 0, t0 - len(turns) * 1000, t0))
     for i, (tin, tcr, tout, trea, cost) in enumerate(turns):
         data = {"model": {"id": MODEL[1], "providerID": MODEL[0]},
                 "tokens": {"input": tin, "output": tout, "reasoning": trea,
                            "cache": {"read": tcr, "write": 0}},
                 "cost": cost}
+        ts = t0 - (len(turns) - 1 - i) * 1000
         con.execute(
             "insert into session_message values (?,?,?,?,?,?,?)",
-            ("%s_%03d" % (prefix, i), sid, "assistant", i, 200 + i, 200 + i,
+            ("%s_%03d" % (prefix, i), sid, "assistant", i, ts, ts,
              json.dumps(data)))
     con.commit()
     con.close()
@@ -147,11 +172,16 @@ def sync_state(tmp):
 
 
 def case(name, turns, budget=100000, rounds=10, extra=None):
-    """建一个「计划 + 一步 doing + 假宿主库」的临时仓库。"""
+    """建一个「计划 + 一步 doing + 假宿主库」的临时仓库。
+
+    顺序与时间戳都有讲究：`tg sync` 只认「这一步开始之后」的轮次，所以
+    1) 先 `start`（它写下 `started_ms`），再造库；
+    2) 库里的轮次落在「刚刚之前的 n 秒」——都在过去，且都在 `started_ms` 之后；
+    3) 把 `started_ms` / `created` 一起挪到这些轮次之前，夹具才不依赖「跑得多快」。
+    """
     print("\n== %s ==" % name)
     tmp = tempfile.mkdtemp(prefix="tgsync_")
     make_config(os.path.join(tmp, "opencode.json"))
-    make_db(os.path.join(tmp, "fake.db"), turns)
     r = run(tmp, ["init", "对账测试"])
     if r.returncode != 0:
         print(r.stdout + r.stderr)
@@ -160,6 +190,15 @@ def case(name, turns, budget=100000, rounds=10, extra=None):
     for a in (extra or []):
         run(tmp, a)
     run(tmp, ["start", "1"])
+    t0 = now_ms()
+    make_db(os.path.join(tmp, "fake.db"), turns, t0=t0)
+    pj = os.path.join(tmp, ".plan", "plan.json")
+    with open(pj, encoding="utf-8") as fh:
+        plan = json.load(fh)
+    plan["steps"][0]["started_ms"] = t0 - (len(turns) + 1) * 1000
+    plan["created"] = iso_ms(t0 - (len(turns) + 2) * 1000)
+    with open(pj, "w", encoding="utf-8") as fh:
+        json.dump(plan, fh, ensure_ascii=False)
     return tmp
 
 
@@ -346,6 +385,14 @@ def main():
     run(tmp13, ["add", "--title", "新活", "--out", "out/b.txt",
                 "--budget", "100000", "--rounds", "10"])
     run(tmp13, ["start", "1"])
+    # 这一步测的是「游标还在 → 不重记」，所以刻意把归账边界挪到很早，
+    # 让边界机制不参与判断（否则 fresh=0 可能只是因为轮次比计划还早）。
+    pj13 = os.path.join(tmp13, ".plan", "plan.json")
+    with open(pj13, encoding="utf-8") as fh:
+        plan13 = json.load(fh)
+    plan13["steps"][0]["started_ms"] = 1
+    with open(pj13, "w", encoding="utf-8") as fh:
+        json.dump(plan13, fh, ensure_ascii=False)
     expect(not os.path.isfile(os.path.join(tmp13, ".plan", "ledger.jsonl")),
            "init --force 清掉了 ledger.jsonl")
     expect(len(sync_state(tmp13).get("ids") or []) == 3,
@@ -432,6 +479,174 @@ def main():
     st16 = sync_state(tmp16)
     expect(st16.get("version") == 2 and len(st16.get("sessions") or {}) == 1,
            "写完就升成 v2 形状，那个会话带着 3 条 id")
+
+    # ---------- 19. 账本行带会话来源 + report 按会话分列 ----------
+    # 一份账本能装多个会话之后，"这笔钱是谁的"必须有答案。sync 写行时带上会话 id，
+    # report 按会话分列；旧行（没有这个字段）单独报，不猜它属于哪个会话。
+    tmp17 = case("19 账本行带来源", TURNS3)
+    add_session(os.path.join(tmp17, "fake.db"), "ses_B",
+                [(500, 0, 50, 0, 0.0002)])
+    run_json(tmp17, ["sync"], sid="ses_test")
+    run_json(tmp17, ["sync"], sid="ses_B")
+    rows17 = ledger(tmp17)
+    expect(rows17 and all(r.get("session") for r in rows17),
+           "每一笔 sync 记录都带会话 id")
+    expect({r.get("session") for r in rows17} == {"ses_test", "ses_B"},
+           "两个会话各记一笔，来源不混")
+    r17 = run(tmp17, ["report"])
+    body17 = r17.stdout + r17.stderr
+    expect("按会话" in body17, "report 里按会话分列")
+    expect("ses_test" in body17 and "ses_B" in body17, "分列里有两个会话 id")
+    expect("$0.000900" in body17 and "$0.000200" in body17,
+           "两边的钱分别列出来（不是只报总数）")
+
+    # 旧账本行（v0.2 之前写的，没有 session 字段）：不猜，单独一句
+    tmp18 = case("19b 旧行不猜", TURNS3)
+    run_json(tmp18, ["sync"], sid="ses_test")
+    p18 = os.path.join(tmp18, ".plan", "ledger.jsonl")
+    with open(p18, encoding="utf-8") as fh:
+        old_rows = [json.loads(x) for x in fh if x.strip()]
+    for x in old_rows:
+        x.pop("session", None)
+    with open(p18, "w", encoding="utf-8", newline="\n") as fh:
+        for x in old_rows:
+            fh.write(json.dumps(x, ensure_ascii=False) + "\n")
+    add_session(os.path.join(tmp18, "fake.db"), "ses_B",
+                [(500, 0, 50, 0, 0.0002)])
+    run_json(tmp18, ["sync", "--session", "ses_B"])
+    r18 = run(tmp18, ["report"])
+    body18 = r18.stdout + r18.stderr
+    expect("没有会话 id 的旧行" in body18, "旧行单独报一桶")
+    expect("不猜" in body18, "并且明说不会替你猜是哪个会话")
+
+    # 只有一个会话时不打这行：没信息量的行也是噪音
+    tmp19 = case("19c 单会话不啰嗦", TURNS3)
+    run_json(tmp19, ["sync"], sid="ses_test")
+    r19 = run(tmp19, ["report"])
+    expect("按会话" not in (r19.stdout + r19.stderr),
+           "只有一个会话时不打「按会话」（没信息量）")
+
+    # ---------- 20. 归账边界：只认「这一步在做」的轮次 ----------
+    # 真机实测出来的坑：计划刚建立、第一步账上就被记了 1102 轮 / $0.486 ——
+    # 那其实是整段对话历史。数是真的，归属是错的，比不记更坏。
+    tmp20 = case("20 归账边界", TURNS3)
+    # 把三轮挪到「一步开始前一小时」：它们属于计划建立之前的对话
+    make_db(os.path.join(tmp20, "fake.db"), TURNS3, t0=now_ms() - 3600 * 1000)
+    d20 = run_json(tmp20, ["sync"])
+    expect(d20 is not None and d20["fresh"] == 0,
+           "这步开始之前的轮次不进账本（实际 %s）" % (d20 or {}).get("fresh"))
+    expect(((d20 or {}).get("skipped") or {}).get("rounds") == 3,
+           "而且报出跳过 3 轮（不许悄悄丢）")
+    expect(((d20 or {}).get("boundary") or {}).get("known") is True,
+           "边界是已知的（tg start 写的 started_ms）")
+    expect(ledger(tmp20) == [], "账本一笔都没多")
+    r20 = run(tmp20, ["sync"])
+    expect("跳过" in (r20.stdout + r20.stderr), "人读的输出里也说了跳过")
+
+    # 老计划没有 started_ms：退到「计划建立时间」，并且说清依据是什么
+    tmp21 = case("20b 老计划退到计划建立时间", TURNS3)
+    pj21 = os.path.join(tmp21, ".plan", "plan.json")
+    with open(pj21, encoding="utf-8") as fh:
+        plan21 = json.load(fh)
+    plan21["steps"][0].pop("started_ms", None)
+    with open(pj21, "w", encoding="utf-8") as fh:
+        json.dump(plan21, fh, ensure_ascii=False)
+    d21 = run_json(tmp21, ["sync"])
+    expect((d21 or {}).get("fresh") == 3,
+           "没有 started_ms 时按计划建立时间划边界，窗口内的轮次照记（实际 %s）"
+           % (d21 or {}).get("fresh"))
+    expect("计划建立" in (((d21 or {}).get("boundary") or {}).get("why") or ""),
+           "并说明边界依据是计划建立时间，不是这步开始时间")
+
+    # 两个时间都没有：不许假装知道边界，全算进来但明说只能当上限
+    tmp22 = case("20c 边界不知道就说不知道", TURNS3)
+    pj22 = os.path.join(tmp22, ".plan", "plan.json")
+    with open(pj22, encoding="utf-8") as fh:
+        plan22 = json.load(fh)
+    plan22["steps"][0].pop("started_ms", None)
+    plan22.pop("created", None)
+    with open(pj22, "w", encoding="utf-8") as fh:
+        json.dump(plan22, fh, ensure_ascii=False)
+    d22 = run_json(tmp22, ["sync"])
+    expect((d22 or {}).get("fresh") == 3,
+           "算不出边界时不许悄悄丢轮次：全算进来（实际 %s）" % (d22 or {}).get("fresh"))
+    expect(((d22 or {}).get("boundary") or {}).get("known") is False,
+           "边界标为未知")
+    r22 = run(tmp22, ["sync"])
+    expect("算不出边界" in (r22.stdout + r22.stderr)
+           or "算不出" in (r22.stdout + r22.stderr), "并且明说算不出边界")
+
+    # 边界之后还有新轮次：`fresh>0` 且 `skipped>0` 的那条路径。
+    # 真机第一次跑就在这儿崩了（人读的输出里取了个不存在的键），所以单独钉一组。
+    tmp24 = case("20a 边界两侧都有轮次", TURNS3)
+    db24 = os.path.join(tmp24, "fake.db")
+    con24 = sqlite3.connect(db24)
+    for i in range(2):
+        old_ts = now_ms() - (7200 - i) * 1000      # 两小时前，边界之外
+        data = {"model": {"id": MODEL[1], "providerID": MODEL[0]},
+                "tokens": {"input": 700, "output": 70, "reasoning": 0,
+                           "cache": {"read": 0, "write": 0}},
+                "cost": 0.0007}
+        con24.execute(
+            "insert into session_message values (?,?,?,?,?,?,?)",
+            ("msg_old_%d" % i, "ses_test", "assistant", -1 - i,
+             old_ts, old_ts, json.dumps(data)))
+    con24.commit()
+    con24.close()
+    d24 = run_json(tmp24, ["sync", "--dry-run"])   # dry-run 不动游标，后面才能再看人读输出
+    expect((d24 or {}).get("fresh") == 3,
+           "边界之后的 3 轮照记（实际 %s）" % (d24 or {}).get("fresh"))
+    expect(((d24 or {}).get("skipped") or {}).get("rounds") == 2,
+           "边界之前的 2 轮报成跳过（实际 %s）"
+           % ((d24 or {}).get("skipped") or {}).get("rounds"))
+    expect(abs((((d24 or {}).get("skipped") or {}).get("usd") or 0) - 0.0014) < 1e-12,
+           "跳过的钱也报出来（2 × 0.0007）")
+    r24 = run(tmp24, ["sync"])
+    body24 = r24.stdout + r24.stderr
+    expect("跳过 2 轮" in body24, "人读的输出里也说跳过 2 轮")
+    expect("归账边界" in body24, "并且先说明边界是什么")
+    rows24 = ledger(tmp24)
+    expect(len(rows24) == 1 and rows24[0]["reqs"] == 3,
+           "账本只记边界之后的 3 轮（实际 %s 笔 / %s 轮）"
+           % (len(rows24), rows24[0]["reqs"] if rows24 else "?"))
+
+    # 跳过的那一堆里，要分清「早就入过账的」和「从没入账的」。
+    # 真机上这一步占了 1213 轮 / $0.553181，其中 1190 轮 / $0.542841 其实早在账本里了；
+    # 混成一个金额报，读的人会以为那是漏掉的钱。
+    pj24 = os.path.join(tmp24, ".plan", "plan.json")
+    with open(pj24, encoding="utf-8") as fh:
+        plan24 = json.load(fh)
+    plan24["steps"][0]["started_ms"] = now_ms()      # 边界挪到「现在」：全窗口都被挡
+    with open(pj24, "w", encoding="utf-8") as fh:
+        json.dump(plan24, fh, ensure_ascii=False)
+    d24b = run_json(tmp24, ["sync"])
+    sk24 = (d24b or {}).get("skipped") or {}
+    expect(sk24.get("rounds") == 5, "边界挪到当下：5 轮全被挡（实际 %s）"
+           % sk24.get("rounds"))
+    expect(sk24.get("accounted") == 3, "其中 3 轮已经在账本里（实际 %s）"
+           % sk24.get("accounted"))
+    expect(sk24.get("unaccounted") == 2, "剩 2 轮从没入过账（实际 %s）"
+           % sk24.get("unaccounted"))
+    expect(abs((sk24.get("usd_accounted") or 0) - 0.0009) < 1e-12,
+           "已在账本里的钱 = 3 轮的 cost 之和（实际 %s）" % sk24.get("usd_accounted"))
+    r24b = run(tmp24, ["sync"])
+    expect("已经在账本里" in (r24b.stdout + r24b.stderr),
+           "人读输出里分清「已在账本里」和「没入账」")
+
+    # 边界的一次性：重试 start 不覆盖它；reset 才重新开始计
+    tmp23 = case("20d 重试不覆盖边界", TURNS3)
+    pj23 = os.path.join(tmp23, ".plan", "plan.json")
+    with open(pj23, encoding="utf-8") as fh:
+        first_ms = json.load(fh)["steps"][0].get("started_ms")
+    expect(isinstance(first_ms, int) and first_ms > 0, "tg start 记下了 started_ms")
+    run(tmp23, ["start", "1"])        # 同一轮的重试
+    with open(pj23, encoding="utf-8") as fh:
+        retry_ms = json.load(fh)["steps"][0].get("started_ms")
+    expect(retry_ms == first_ms, "重试 start 不覆盖边界（否则上一轮的钱会被切掉）")
+    run(tmp23, ["reset", "1", "--rounds"])
+    with open(pj23, encoding="utf-8") as fh:
+        expect("started_ms" not in json.load(fh)["steps"][0],
+               "reset 清掉边界：重新开始 = 重新计")
 
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:

@@ -104,8 +104,24 @@ def main():
     check("漏 --rounds 会警告", "没给 --rounds" in (r.stdout or ""))
     r = run(["add", "--title", "太小预算的步骤", "--budget", "500", "--out", "notes/03.md",
              "--depends", "1", "--rounds", "1"], root,
-            must="不到一次请求的上下文")
-    check("预算 < baseline 会警告", "不到一次请求的上下文" in (r.stdout or ""))
+            absent="不到一次请求的上下文")
+    check("按轮数定了预算就不再骂 token 预算小（给了 --rounds 还报就是假警告）",
+          "不到一次请求的上下文" not in (r.stdout or ""))
+    r = run(["add", "--title", "手写小预算", "--budget", "500", "--out", "notes/04.md",
+             "--depends", "1"], root, must="不到一次请求的上下文")
+    check("手写 --budget 且没给 --rounds 时仍然警告（这时才是真问题）",
+          "不到一次请求的上下文" in (r.stdout or ""))
+
+    # 复用梯子：默认档不是「用户的选择」，没写就不该被问「为什么新写」
+    r = run(["add", "--title", "没写复用档", "--out", "notes/05.md",
+             "--depends", "1", "--rounds", "2"], root, absent="却没有 --note")
+    check("没显式给 --reuse 时不该问「为什么新写」（默认档不等于选过）",
+          "却没有 --note" not in (r.stdout or ""))
+    r = run(["add", "--title", "显式新写", "--out", "notes/06.md",
+             "--depends", "1", "--rounds", "2", "--reuse", "new"], root,
+            must="却没有 --note")
+    check("显式 --reuse new 且没 --note 时才问（这时问得对）",
+          "却没有 --note" in (r.stdout or ""))
 
     # ---------------- amend：todo 步骤 ----------------
     r = run(["amend", "2", "--add-accept", "file:exists:app.py",
@@ -208,6 +224,20 @@ def main():
     check("简报报出已用轮数", "轮数：2 / 2 轮" in body)
     check("简报没 cost 时指路 sync", "没有 cost 记录" in body)
     check("简报明说新会话的轮数不会自动记账", "不会自动记进这个计划" in body)
+    check("简报的复用级数与档位对得上（existing 是第 2 级）",
+          "前 1 级都不成立" in body, body[body.find("复用梯子"):][:40])
+
+    # 产物路径撞车的步骤：自己的产物不该出现在自己的「不在范围内」里，也不该重复列
+    run(["add", "--title", "共用产物", "--out", "notes/01.md", "--depends", "1",
+         "--rounds", "2", "--reuse", "existing"], root)
+    r = run(["handoff", "7"], root, expect=0)
+    b7 = [x for x in os.listdir(os.path.join(root, ".plan", "brief")) if x.startswith("07-")]
+    body7 = (open(os.path.join(root, ".plan", "brief", b7[0]), encoding="utf-8").read()
+             if b7 else "")
+    sec7 = body7.split("## 明确不在范围内")[-1] if "## 明确不在范围内" in body7 else body7
+    check("自己的产物不算「别的步骤的东西」", "notes/01.md" not in sec7)
+    check("「不在范围内」不留重复条目", sec7.count("`tg.py`") <= 1,
+          "重复 %d 次" % sec7.count("`tg.py`"))
 
     # ---------------- 收尾：reconcile 仍可用 ----------------
     r = run(["reconcile"], root, expect=0)

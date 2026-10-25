@@ -67,8 +67,13 @@ def main():
             expect(k in state, "/api/state 含字段 %s" % k)
         money = state.get("money") or {}
         for k in ("ledger_usd", "rows", "rounds", "per_round_usd", "host_usd",
-                  "other_sessions", "other_usd"):
+                  "other_sessions", "other_usd", "by_session"):
             expect(k in money, "/api/state.money 含 %s" % k)
+        expect(isinstance(money.get("by_session"), list),
+               "money.by_session 是列表（按会话分列；没有 cost 时是空表，不编数）")
+        expect(all(isinstance(g, dict) and set(("session", "usd", "rows", "reqs")) <= set(g)
+                   for g in (money.get("by_session") or [])),
+               "by_session 每项含 session / usd / rows / reqs")
         syncing = state.get("sync") or {}
         for k in ("session", "synced_ids", "updated", "same_session",
                   "pending_in_window"):

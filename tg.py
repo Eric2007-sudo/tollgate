@@ -42,6 +42,24 @@ tollgate 0.3 新增：
                              下限可以补成接近真实总数，而且补多少次都不翻倍。
   看板同步游标口径             对账行按「正在看的这个会话」的游标算，不再拿别的会话的比。
 
+tollgate 0.4 新增（拿真活跑闭环时自己撞出来的）：
+  账本行带会话来源            sync 写的每笔记录都带 session；report 按会话分列，
+                              没有会话 id 的旧行单独报一桶 —— 不替人猜「这笔钱是谁的」。
+  归账边界                    tg start 记下 steps[].started_ms，sync 只认这之后开始的
+                              轮次。之前会把「会话最近 2000 轮」整段算给当前这一步：
+                              计划刚建立、第 1 步就吃下 1102 轮 / $0.486120（都是计划
+                              建立前的对话）。数是真的、归属是错的，比不记更坏。
+                              重试 start 不覆盖边界，reset 清掉；老计划退到 plan.created，
+                              两个都读不出来时明说「算不出边界」，不猜。
+  跳过多少钱要拆开             被边界挡住的轮次报成「已在账本里」+「从没入账」两半：
+                              真机 1213 轮 / $0.553181 里，1190 轮 / $0.542841 早就入账了。
+                              混成一个数，读的人会以为账本漏了 55 美分。
+  假警告                        --budget / --reuse 没显式给就不算「用户的选择」：
+                              按轮数定了预算不再骂 token 预算小；默认复用档不再问
+                              「为什么只能新写」。假警告教人忽略警告。
+  简报范围                      handoff 的「明确不在范围内」不再把这一步自己的产物
+                              列进去（也不再重复列同一个文件），档位措辞按级数算。
+
 四条不变的设计约束：
   1. 零依赖      只用标准库，Windows / macOS / Linux 同一份代码
   2. 单一真相    .plan/plan.json 是唯一真源，plan.md 只是渲染视图
@@ -67,6 +85,11 @@ from pathlib import Path
 
 PLAN_DIR = ".plan"
 SCHEMA = 2
+
+# 没给 --budget 时的默认 token 预算。它只是「探测器」的默认刻度：真正的预算口径是
+# --rounds。所以拿它去和「一次请求的上下文」比大小是没有意义的——那也是 v0.4 修掉
+# 的一个误报（用户明明按轮数定了预算，还被骂 token 预算太小）。
+DEFAULT_BUDGET = 8000
 
 TIERS = ("cheap", "std", "deep")
 
@@ -471,7 +494,7 @@ def cmd_add(a):
     n = (max((s["n"] for s in plan["steps"]), default=0)) + 1
     if a.out is None:
         die("每一步都必须有产物路径 --out。纯分析类步骤写 notes/%02d-x.md" % n)
-    if a.reuse not in REUSE_RUNGS:
+    if a.reuse is not None and a.reuse not in REUSE_RUNGS:
         die("--reuse 必须是 %s 之一" % " / ".join(REUSE_RUNGS))
 
     deps = []
@@ -486,14 +509,16 @@ def cmd_add(a):
         if d >= n or d < 1:
             die("--depends %d 不合法：只能依赖已存在的更早步骤" % d)
 
+    budget = a.budget if a.budget is not None else DEFAULT_BUDGET
+    reuse = a.reuse or "new"          # 没写就不问「为什么新写」：默认档不是用户的选择
     step = {
         "n": n,
         "title": a.title,
         "tier": a.tier,
-        "budget": a.budget,
+        "budget": budget,
         "out": a.out,
         "read": list(a.read or []),
-        "reuse": a.reuse,
+        "reuse": reuse,
         "depends": deps,
         "stop": list(a.stop or []),
         "accept": list(a.accept or []),
@@ -506,9 +531,12 @@ def cmd_add(a):
     plan["updated"] = now_iso()
     save(root, plan)
     out("已加 #%d %s（tier=%s，预算 %s，复用=%s）"
-        % (n, a.title, a.tier, fmt_k(a.budget), a.reuse))
+        % (n, a.title, a.tier, fmt_k(budget), reuse))
     base = plan.get("baseline_context") or 0
-    if base and a.budget and a.budget < base:
+    # 只在「用户真的手写了 --budget」且「没按轮数定预算」时才提醒。
+    # 默认 8000 是探测器的刻度，拿它和一次请求的上下文比大小没有意义；
+    # 而已经给了 --rounds 的人，预算口径早就定了，再骂一遍就是噪音。
+    if a.budget is not None and not a.rounds and base and a.budget < base:
         warn("这步预算 %s 还不到一次请求的上下文（%s）。绝对 token 预算在小步上"
              "几乎必然失真，改用 --rounds 按轮数定预算（实测偏差可达 70× 以上）"
              % (fmt_k(a.budget), fmt_k(base)))
@@ -518,7 +546,7 @@ def cmd_add(a):
     if not step["accept"]:
         warn("没有验收断言，gate 会无条件通过。至少加一条 file:exists:")
     if a.reuse == "new" and not a.note:
-        warn("复用梯子选到「只能新写」，却没有 --note 说明为什么前 6 级都不成立")
+        warn("复用梯子显式选了「只能新写」，却没有 --note 说明为什么前 6 级都不成立")
     if not step["stop"]:
         warn("没有 --stop 停止条件。小模型在「现实与计划不符」时会即兴发挥，"
              "写一条「如果 X 就停下来汇报」")
@@ -664,6 +692,10 @@ def cmd_start(a):
 
     s["status"] = "doing"
     s["rounds"] = s.get("rounds", 0) + 1
+    # 归账边界：这一步从什么时候开始花钱。第一次 start 时记下，重试 start 不覆盖
+    # （否则重试一次就会把上一轮的钱从账上切掉）。reset 会清掉它 = 重新开始计边界。
+    if not s.get("started_ms"):
+        s["started_ms"] = int(time.time() * 1000)
     plan["updated"] = now_iso()
     save(root, plan)
     out("#%d %s 开始（第 %d/%d 轮，tier=%s，预算 %s）"
@@ -682,6 +714,7 @@ def cmd_reset(a):
     s = step_by_n(plan, a.n)
     s["status"] = "todo"
     s["note"] = ""
+    s.pop("started_ms", None)          # 重新开始 = 归账边界重新算
     if a.rounds:
         s["rounds"] = 0
     plan["updated"] = now_iso()
@@ -1076,8 +1109,9 @@ def cmd_handoff(a):
         L.append("- 轮数上限：%d 轮 —— **预算按轮数算**，上面那个 token 数是探测器，"
                  "不是配额" % s["budget_rounds"])
     if s.get("reuse"):
-        L.append("- 复用梯子：%s —— 先确认前 6 级都不成立再写新代码"
-                 % REUSE_LABEL.get(s["reuse"], s["reuse"]))
+        L.append("- 复用梯子：%s —— 先确认前 %d 级都不成立再写新代码"
+                 % (REUSE_LABEL.get(s["reuse"], s["reuse"]),
+                    REUSE_RUNGS.index(s["reuse"]) if s["reuse"] in REUSE_RUNGS else 0))
     L.append("")
 
     # 已经花掉多少：执行者需要知道还剩多少余地，才不会把「翻 40 个文件」当成正常操作。
@@ -1182,7 +1216,13 @@ def cmd_handoff(a):
 
     L.append("## 明确不在范围内")
     L.append("")
-    other_outs = [x.get("out") for x in others if x.get("out")]
+    own = (s.get("out") or "").strip()
+    other_outs = []
+    for x in others:
+        o = (x.get("out") or "").strip()
+        # 同一个产物路径可能被多个步骤共用；自己这一步的产物当然也不是「范围外」。
+        if o and o != own and o not in other_outs:
+            other_outs.append(o)
     if other_outs:
         L.append("下面这些文件属于**别的步骤**，这一轮不要动：")
         L.append("")
@@ -1342,6 +1382,18 @@ def cmd_report(a):
                 % (money(est_tot), len(est)))
         if not est:
             out("  全部来自宿主记录，不是估算。")
+        # 一份账本可以装多个会话（tg sync --session <id>），钱就得能追到来源。
+        # 只有一行会话时不必啰嗦；没有会话 id 的旧行单独报，不猜它是谁的。
+        groups = cost_by_session(ledger)
+        known = [(sid, g) for sid, g in groups if sid]
+        unknown = next((g for sid, g in groups if not sid), None)
+        if len(known) > 1 or (known and unknown):
+            parts = ["%s $%.6f（%d 笔 / %d 轮）" % (sid[:12], g["usd"], g["rows"], g["reqs"])
+                     for sid, g in known]
+            if unknown:
+                parts.append("没有会话 id 的旧行 $%.6f（%d 笔，v0.2 之前写的，不猜）"
+                             % (unknown["usd"], unknown["rows"]))
+            out("  按会话：%s" % " ｜ ".join(parts))
 
     out("")
     out("== 预算准确性 ==")
@@ -2133,6 +2185,61 @@ def cost_for(ledger, n=None):
     return (tot, cnt) if cnt else (None, 0)
 
 
+def cost_by_session(ledger):
+    """账本里的钱按会话分组：[(会话id, {"usd","rows","reqs"}), ...]，多的在前。
+
+    v0.3 起一份账本可以装多个会话（`tg sync --session <id>`），所以钱必须能追到来源。
+    v0.2 之前写的行没有 `session` 字段 —— 那些归到空字符串这一个桶里，**不猜**它是
+    谁的会话，报表里单独说一句。
+    """
+    groups = {}
+    for r in ledger:
+        c = r.get("cost")
+        if not c:
+            continue
+        sid = str(r.get("session") or "")
+        g = groups.setdefault(sid, {"usd": 0.0, "rows": 0, "reqs": 0})
+        g["usd"] += float(c)
+        g["rows"] += 1
+        g["reqs"] += r.get("reqs", 0) or 0
+    for g in groups.values():
+        g["usd"] = round(g["usd"], 12)
+    return sorted(groups.items(), key=lambda kv: -kv[1]["usd"])
+
+
+def ts_ms(v):
+    """把宿主的时间戳统一成毫秒。秒级 / 毫秒级都见得到（不同表、不同版本），
+    拿错单位会让「这轮是不是这一步花的」整整差 1000 倍，所以这里显式归一。"""
+    try:
+        v = int(v or 0)
+    except Exception:
+        return 0
+    if v <= 0:
+        return 0
+    # 10^11 毫秒 = 1973 年；比它小的只可能是「秒」
+    return v * 1000 if v < 100000000000 else v
+
+
+def sync_boundary(step, plan):
+    """这一步的用量从什么时候开始算。返回 (epoch 毫秒 或 None, 依据说明)。
+
+    为什么需要这个：`sync` 读的是「会话最近的 2000 轮」，而会话里很多轮次发生在
+    计划建立之前、甚至在上一步。全算给当前这一步，第一步就会吃掉整个对话历史——
+    实测一次：计划刚建立、第一步账上就被记了 1102 轮 / $0.486（其实是整段对话）。
+    数是真的，归属是错的，比不记更坏。
+
+    优先级：这步的 `started_ms`（`tg start` 写的）→ 计划的 `created`（老计划没有
+    前者）→ None。None 时必须说出来，不能假装知道边界。
+    """
+    v = step.get("started_ms")
+    if isinstance(v, int) and v > 0:
+        return v, "这步开始的时间"
+    v = plan_created_ms(plan)
+    if v:
+        return v, "计划建立的时间（这步没有 started_ms）"
+    return None, ""
+
+
 def plan_created_ms(plan):
     """计划的建立时间（epoch 毫秒）。解析不了就返回 None —— 不拿假时间做比较。"""
     raw = (plan or {}).get("created") or ""
@@ -2170,6 +2277,65 @@ def others_payload(others):
     }
 
 
+def iso_from_ms(ms):
+    """epoch 毫秒 → 本地时间串。给人看归账边界用。"""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ms) / 1000.0))
+    except Exception:
+        return "?"
+
+
+def boundary_payload(bound, why):
+    """`--json` 里的归账边界。bound 为 None 时必须明说「不知道」，不能填个假时间。"""
+    return {
+        "ms": bound,
+        "at": iso_from_ms(bound) if bound else None,
+        "why": why if bound else "算不出边界（plan 里没有 started_ms / created）",
+        "known": bool(bound),
+    }
+
+
+def skipped_payload(skipped, seen=None):
+    """被边界挡在外面的轮次：多少轮、多少钱、从什么时候到什么时候。
+
+    还要分清「已经在账本里的」和「从没入过账的」。边界挡下来的轮次里，很大一部分是
+    更早某次 sync 已经记过的（它们只是比这一步开始得更早）。把两者混成一个金额，
+    读的人会以为那全是「漏掉的钱」—— 报错方向的数比不报更坏。
+    """
+    if not skipped:
+        return {"rounds": 0, "usd": 0.0, "first": None, "last": None,
+                "accounted": 0, "usd_accounted": 0.0,
+                "unaccounted": 0, "usd_unaccounted": 0.0}
+    seen = seen or set()
+    ts = sorted(ts_ms(t.get("ts")) for t in skipped)
+    acc = [t for t in skipped if t["id"] in seen]
+    una = [t for t in skipped if t["id"] not in seen]
+    return {
+        "rounds": len(skipped),
+        "usd": round(sum(t.get("cost") or 0 for t in skipped), 12),
+        "first": iso_from_ms(ts[0]),
+        "last": iso_from_ms(ts[-1]),
+        "accounted": len(acc),
+        "usd_accounted": round(sum(t.get("cost") or 0 for t in acc), 12),
+        "unaccounted": len(una),
+        "usd_unaccounted": round(sum(t.get("cost") or 0 for t in una), 12),
+    }
+
+
+def skipped_lines(sk):
+    """把 `skipped_payload` 翻成人话。空的时候返回空列表（不占屏幕）。"""
+    if not sk or not sk.get("rounds"):
+        return []
+    L = ["  跳过 %d 轮（%s ～ %s，共 $%.6f）：那段时间这一步还没开始"
+         % (sk["rounds"], sk["first"], sk["last"], sk["usd"])]
+    if sk.get("accounted"):
+        L.append("    其中 %d 轮 / $%.6f 已经在账本里了（更早的 sync 记的，不是漏账）；"
+                 "剩 %d 轮 / $%.6f 从没入过账 —— 它们不属于这一步，所以也不记。"
+                 % (sk["accounted"], sk["usd_accounted"],
+                    sk["unaccounted"], sk["usd_unaccounted"]))
+    return L
+
+
 def others_line(others):
     if not others:
         return None
@@ -2197,8 +2363,16 @@ def cmd_sync(a):
             die("当前没有 doing 的步骤，用量无处可归。先 tg start N，"
                 "或者显式指定：tg sync --step N")
 
-    turns = read_turns(row["session"], limit=SYNC_KEEP)
-    truncated = len(turns) >= SYNC_KEEP
+    all_turns = read_turns(row["session"], limit=SYNC_KEEP)
+    truncated = len(all_turns) >= SYNC_KEEP
+    # 归账边界：只认「这一步在做的时候」花掉的轮次。会话里更早的轮次（计划建立之前、
+    # 上一步做的）不属于这一步，硬算进来就是错的归属 —— 数是真的，账是假的。
+    bound, bound_why = sync_boundary(s, plan)
+    if bound:
+        turns = [t for t in all_turns if ts_ms(t.get("ts")) >= bound]
+        skipped = [t for t in all_turns if ts_ms(t.get("ts")) < bound]
+    else:
+        turns, skipped = all_turns, []
     # 游标按会话分开存：第一次同步某个会话时它当然是全新的，但**回来的时候不会重记**。
     cur = load_cursors(root)
     mine = (cur["sessions"].get(row["session"]) or {}).get("ids") or []
@@ -2207,11 +2381,19 @@ def cmd_sync(a):
 
     if not fresh:
         msg = "没有新轮次：会话 %s 最近 %d 轮都已入账。" % (
-            row["session"][:12], len(turns))
+            row["session"][:12], len(all_turns))
+        sk = skipped_payload(skipped, seen)
+        if bound and skipped:
+            msg += "\n" + "\n".join(skipped_lines(sk))
+        elif not bound:
+            msg += ("\n  注意：plan 里没有这步的开始时间、也没有计划的建立时间，"
+                    "算不出边界 —— 窗口内的轮次被整段当成这一步的。")
         others = other_spenders(plan, row["session"])
         if a.json:
-            out(json.dumps({"ok": True, "fresh": 0, "turns_read": len(turns),
+            out(json.dumps({"ok": True, "fresh": 0, "turns_read": len(all_turns),
                             "session": row["session"], "step": s["n"],
+                            "boundary": boundary_payload(bound, bound_why),
+                            "skipped": sk,
                             "others": others_payload(others)},
                            ensure_ascii=False, indent=1))
         else:
@@ -2247,6 +2429,7 @@ def cmd_sync(a):
 
     rec = {"ts": now_iso(), "step": s["n"], "in": tin, "out": tout + trea,
            "reqs": len(fresh), "cache_read": tcr, "src": "opencode.db",
+           "session": row["session"],
            "note": "sync 自动对账（%d 轮）" % len(fresh)}
     if tcw:
         rec["cache_write"] = tcw
@@ -2277,8 +2460,10 @@ def cmd_sync(a):
 
     if a.json:
         out(json.dumps({
-            "ok": True, "fresh": len(fresh), "turns_read": len(turns),
+            "ok": True, "fresh": len(fresh), "turns_read": len(all_turns),
             "session": row["session"], "step": s["n"],
+            "boundary": boundary_payload(bound, bound_why),
+            "skipped": skipped_payload(skipped, seen),
             "synced": {"in": tin, "out": tout, "reasoning": trea,
                        "reqs": len(fresh), "cache_read": tcr,
                        "cache_write": tcw},
@@ -2297,6 +2482,15 @@ def cmd_sync(a):
     out("  会话 %s ｜ 本次同步 %d 轮（上次 sync 之后）" % (row["session"][:12], len(fresh)))
     out("  这个会话已入账 %d 条轮次；账本里共有 %d 个会话的游标"
         % (len(mine) + len(fresh), len(cur["sessions"]) or 1))
+    if bound:
+        out("  归账边界：%s —— %s；更早的轮次不是这一步花的，不计入"
+            % (iso_from_ms(bound), bound_why))
+    else:
+        out("  归账边界：**算不出**（plan 里没有这步的开始时间、也没有计划的建立时间）。"
+            "窗口内的轮次被整段当成这一步的——这个数只能当上限看。")
+    if skipped:
+        for line in skipped_lines(skipped_payload(skipped, seen)):
+            out(line)
     if truncated:
         out("  只读到最近 %d 轮 —— 更早的轮次读不到，也就不会计入。这时的 tok 数"
             "不等于「会话总共跑了多少」，那看 tg ctx。" % SYNC_KEEP)
@@ -2367,6 +2561,11 @@ def state_payload(root):
         "est_rows": sum(1 for r in ledger if r.get("cost") and r.get("cost_est")),
         "per_round_usd": (usd_total / usd_rounds) if (usd_total and usd_rounds) else None,
         "host_usd": (rep.get("cumulative") or {}).get("usd_db"),
+        # 钱按会话分列：账本可以装多个会话，看板上得能看出这笔钱是谁的。
+        # 没有会话 id 的旧行（v0.2 之前）单独一桶，session 为 ""，前端不猜。
+        "by_session": [{"session": sid, "usd": g["usd"], "rows": g["rows"],
+                        "reqs": g["reqs"]}
+                       for sid, g in cost_by_session(ledger)],
     }
 
     # 对账状态：只看手上这 40 轮窗口里还有几轮没入账 —— 窗口外的东西看板也不该假装知道。
@@ -2520,7 +2719,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="tg", description="tollgate：agent 的过闸 —— 计划预算 · 上下文预算 · 本地账本")
     ap.add_argument("-V", "--version", action="version",
-                    version="tollgate 0.3（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
+                    version="tollgate 0.4（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="建立 .plan/")
@@ -2537,14 +2736,16 @@ def main():
     p = sub.add_parser("add", help="追加一个步骤")
     p.add_argument("--title", required=True)
     p.add_argument("--tier", choices=TIERS, default="std")
-    p.add_argument("--budget", type=int, default=8000, help="token 预算（易失真，见 --rounds）")
+    p.add_argument("--budget", type=int, default=None,
+                   help="token 预算（易失真，见 --rounds；不给就是默认 %d）"
+                        % DEFAULT_BUDGET)
     p.add_argument("--rounds", type=int, default=0,
                    help="这步最多允许几轮请求（比 token 好估，推荐）")
     p.add_argument("--out", help="产物路径（必填）")
     p.add_argument("--read", action="append", help="计划内要读的文件，可重复")
     p.add_argument("--depends", help="依赖的步骤号，逗号分隔，如 1,2")
-    p.add_argument("--reuse", choices=REUSE_RUNGS, default="new",
-                   help="复用梯子：skip/existing/stdlib/native/dep/line/new")
+    p.add_argument("--reuse", choices=REUSE_RUNGS, default=None,
+                   help="复用梯子：skip/existing/stdlib/native/dep/line/new（默认 new）")
     p.add_argument("--stop", action="append", help="停止条件，可重复")
     p.add_argument("--accept", action="append", help="验收断言，可重复")
     p.add_argument("--note", default="")

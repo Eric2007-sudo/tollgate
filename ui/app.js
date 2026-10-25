@@ -74,9 +74,14 @@ function renderCards(s) {
 
   var m = s.money || {};
   if (m.ledger_usd != null) {
+    var sessNote = "";
+    var bs = m.by_session || [];
+    var named = bs.filter(function (g) { return g.session; });
+    if (named.length > 1) sessNote = " · " + named.length + " 个会话";
+    else if (!named.length && bs.length) sessNote = " · 旧行没有会话 id";
     box.appendChild(card("账本花费", cash(m.ledger_usd),
       m.rounds + " 轮 · 单轮 " + cash(m.per_round_usd) +
-      (m.est_rows ? " · 含 " + m.est_rows + " 笔估算" : "") + " · 截至上次 sync"));
+      (m.est_rows ? " · 含 " + m.est_rows + " 笔估算" : "") + sessNote + " · 截至上次 sync"));
   } else {
     box.appendChild(card("账本花费", "没有", "跑 tg sync 让宿主报账"));
   }

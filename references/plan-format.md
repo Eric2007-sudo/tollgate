@@ -133,7 +133,12 @@ BOM 只影响第一行，而账本第一行丢掉等于悄悄少记一笔钱—�
 | `steps[].accept` | 验收断言数组 | `add --accept` |
 | `steps[].status` | `todo` / `doing` / `done` / `blocked` | CLI |
 | `steps[].rounds` | 已开始的重试轮次（`start` 累加）。因状态回滚而保留，不随 `reset` 清零 | CLI |
+| `steps[].started_ms` | 这一步**开始花钱的时刻**（epoch 毫秒）。`sync` 的归账边界：更早的轮次不算这一步的。第一次 `start` 写入，重试 `start` 不覆盖，`reset` 清掉 | `start` / `reset` |
 | `steps[].note` | 备注；`block` 时存卡点原因 | `block` / `amend --note` |
+
+`started_ms` 缺了会怎样：老计划（v0.3 之前建的）没有这个字段，`sync` 退到用计划的
+`created` 当边界，并在输出里说明依据是「计划建立的时间」；两个都读不出来时**不猜**——
+窗口内的轮次全算进来，同时明说「算不出边界，只能当上限看」。
 
 `rounds` 和 `budget_rounds` 是两件事：前者是**已经花掉**的轮次，后者是**允许花**的轮次。
 `report` 拿两者相比，超了才提示。
@@ -174,7 +179,8 @@ tg amend 0 --add-exclude "data/*.json" --max-rounds 2
 {"ts": "2026-10-25T11:29:21", "step": 1, "in": 0, "out": 0, "note": "DONE"}
 {"ts": "2026-10-25T11:31:02", "step": 2, "in": 8400, "out": 1200, "reqs": 2, "note": "第一版 tsc 报错"}
 {"ts": "2026-10-25T11:33:40", "step": 2, "in": 0, "out": 0, "amend": {"accept": [["file:exists:src/auth/jwt.ts"], ["file:exists:src/auth/jwt.ts", "cmd:npx tsc --noEmit"]]}, "forced": false, "note": "忘了类型检查"}
-{"ts": "2026-10-25T14:22:07", "step": 1, "in": 2384800, "out": 575500, "reqs": 714, "cache_read": 45495400, "src": "opencode.db", "cost": 0.276054, "note": "sync 自动对账（714 轮）"}
+{"ts": "2026-10-25T14:22:07", "step": 1, "in": 2384800, "out": 575500, "reqs": 714, "cache_read": 45495400, "src": "opencode.db", "session": "ses_e98e7b99", "cost": 0.276054, "note": "sync 自动对账（714 轮）"}
+{"ts": "2026-10-25T14:41:09", "step": 2, "in": 5200, "out": 610, "reqs": 2, "cache_read": 88100, "src": "opencode.db", "session": "ses_e8e92ea4", "cost": 0.001642, "note": "sync 自动对账（2 轮）"}
 ```
 
 四类行，同一张表：
@@ -195,13 +201,46 @@ tg amend 0 --add-exclude "data/*.json" --max-rounds 2
 | `reqs` | 这一段对账覆盖的轮数 |
 | `cache_read` / `cache_write` | 缓存命中 / 写入的 token。**只存档，不参与预算求和** |
 | `src` | 数据来源。目前只有 `opencode.db`——看到它就说明这行不是人手写的 |
+| `session` | **这笔钱是哪个会话花的**（v0.3 起）。一份账本能装多个会话，靠这个字段才追得到来源 |
 | `cost` | 宿主记的真实美元金额（逐轮 `cost` 之和） |
 | `cost_est` | 仅当宿主没记 `cost`、改用本地价目重算时出现。**它标的是「上界」**，不是账单 |
 | `note` | `sync 自动对账（N 轮）`。N 与 `reqs` 相等；不等就说明有人改过账本 |
 
+`session` 为什么必须有：v0.3 起一份账本可以装多个会话（`tg sync --session <id>` 补子 agent /
+另一个窗口的账）。没有这个字段，「这笔钱是谁的」就永久丢了，分摊和复盘都只能靠猜。
+`tg report` 会把钱按会话分列；**v0.2 之前写的行没有这个字段**，那些归到一个
+「没有会话 id 的旧行」桶里单独报——工具不猜它属于哪个会话。
+
 为什么要单列 `cache_read` 而不是并进 `in`：命中缓存的重读价是输入价的 1/50（本机中转实测），
 把它并进预算求和，会让每一步看起来都超预算 19 倍（实测 714 轮会话里 `cache_read` 是新输入的 19.08 倍），
 于是你会去治「上下文太大」这个假病，而真正该改的是轮数。**预算看 `in + out`，钱看 `cost`。**
+
+### 归账边界：`sync` 读的窗口比「这一步」大
+
+`sync` 读的是会话最近 2000 轮，可会话里一大半轮次发生在计划建立之前、或者上一步还在做的时候。
+全算给当前这一步，账就错了——**数是真的，归属是假的**。所以每次 `sync` 先算一条边界：
+
+| 有 `steps[].started_ms` | 用「这步开始的时间」，`why = 这步开始的时间` |
+| 只有 `plan.created` | 用「计划建立的时间」，`why` 里写明依据是老计划 |
+| 两个都没有 | **不猜**：窗口内的轮次全算进来，`boundary.known = false`，并提示只能当上限看 |
+
+被边界挡在外面的轮次不进账本、也不进游标（下次还是会被挡，不会漏记也不会重记），
+但在 `--json` 里报出来（下面是**字段形状示意，数字是编的**，不是某次实测）：
+
+```json
+"boundary": {"ms": 1792915200000, "at": "2026-10-25 15:56:12",
+             "why": "这步开始的时间", "known": true},
+"skipped": {"rounds": 388, "usd": 0.121004,
+            "first": "2026-10-25 14:20:03", "last": "2026-10-25 15:55:58",
+            "accounted": 300, "usd_accounted": 0.09,
+            "unaccounted": 88, "usd_unaccounted": 0.031004}
+```
+
+`skipped.usd` 只统计宿主记了 `cost` 的轮次——没 `cost` 的不折算成钱，宁可少报。
+里面的 `accounted` / `unaccounted` 必须分开报：跳过的轮次里往往有一大半**早就记过账了**
+（它们只是比这一步开始得更早），混成一个金额，读的人会以为那是漏掉的钱。
+真机上是 1213 轮 / \$0.553181 全部跳过，其中 1190 轮 / \$0.542841 早在账本里，
+只剩 23 轮 / \$0.010340 从没入过账。
 
 ### 删文件前先看这张表
 
