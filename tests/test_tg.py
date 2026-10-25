@@ -284,6 +284,118 @@ def main():
     check("真回归用非 0 退出", r.returncode == 1)
     run(["reset", "9"], root)          # 复原，别影响后面那条「reconcile 可用」
 
+    # ---------------- --json 接缝：编排层（orch）唯一的机器接口 ----------------
+    # 这一组测的不是「能不能打印 JSON」，而是「不用问一句人话就能驱动它」：
+    # 整个 stdout 必须能一次 json.loads、必须带 api 版本号、失败仍然用 exit code 说话。
+    def jrun(args, expect):
+        r = run(args, root, expect=expect)
+        try:
+            return r, json.loads(r.stdout)
+        except Exception as e:
+            check("--json 必须整体可 json.loads：%s" % " ".join(args), False,
+                  "%s | stdout=%r" % (e, (r.stdout or "")[:200]))
+            return r, {}
+
+    r, d = jrun(["status", "--json"], 0)
+    check("status --json 带 api 版本", d.get("api") == 1, repr(d.get("api")))
+    check("status --json 报 cmd 名", d.get("cmd") == "status", repr(d.get("cmd")))
+    check("status --json 的 plan.id 是活的",
+          d.get("plan", {}).get("id") == plan_json(root)["id"])
+    check("status --json 的 steps 与 plan 对齐",
+          len(d.get("steps", [])) == len(plan_json(root)["steps"]))
+    check("status --json 的 doing 一定是列表（并发时会有多个号）",
+          isinstance(d.get("doing"), list), repr(d.get("doing")))
+    check("status --json 的进度是数不是字符串",
+          isinstance(d.get("progress", {}).get("done"), int))
+
+    r, d = jrun(["parallel", "--json"], 0)
+    check("parallel --json 给批次列表", isinstance(d.get("batches"), list),
+          repr(type(d.get("batches"))))
+    check("parallel --json 给 max_fanout（并发路数要靠它拴住）",
+          isinstance(d.get("max_fanout"), int), repr(d.get("max_fanout")))
+    check("parallel --json 的 conflicts 是列表", isinstance(d.get("conflicts"), list))
+
+    r, d = jrun(["report", "--json"], 0)
+    check("report --json 有 totals", isinstance(d.get("totals", {}).get("budget"), int))
+    check("report --json 每步带 verdict",
+          all("budget_verdict" in s for s in d.get("steps", [])),
+          repr(d.get("steps", [])[:1]))
+    check("report --json 的 by_session 是列表", isinstance(d.get("by_session"), list))
+
+    # 通过的情况：自己造一个一定通过的步骤，别借前面用例的状态
+    with open(os.path.join(root, "notes", "11.md"), "w", encoding="utf-8") as fh:
+        fh.write("ok\n")
+    run(["add", "--title", "json 成功用例", "--out", "notes/11.md", "--depends", "1",
+         "--rounds", "1", "--reuse", "existing",
+         "--accept", "file:exists:notes/11.md"], root)
+    n_ok = len(plan_json(root)["steps"])
+    r, d = jrun(["gate", str(n_ok), "--json"], 0)
+    check("gate --json 通过时 ok=true", d.get("ok") is True, repr(d.get("ok")))
+    check("gate --json 给 checks 明细",
+          isinstance(d.get("checks"), list) and bool(d["checks"]), repr(d.get("checks")))
+    check("gate --json 的 exit 字段与真退出码一致", d.get("exit") == 0, repr(d.get("exit")))
+
+    # 失败的情况：--json 也得 exit 1，而且不许把真 FAIL 冒充成超时
+    run(["add", "--title", "json 失败用例", "--out", "notes/12.md", "--depends", "1",
+         "--rounds", "1", "--reuse", "existing",
+         "--accept", "file:exists:notes/绝不存在.txt"], root)
+    n_bad = len(plan_json(root)["steps"])
+    r, d = jrun(["gate", str(n_bad), "--json"], 1)
+    check("gate --json 失败时 ok=false", d.get("ok") is False, repr(d.get("ok")))
+    check("gate --json 失败时 exit 字段=1", d.get("exit") == 1, repr(d.get("exit")))
+    check("gate --json 真 FAIL 不记成 timeout",
+          all(c.get("timeout") is False for c in d.get("checks", [])),
+          repr(d.get("checks")))
+    check("gate --json 把 failed 与 timed 分开数",
+          d.get("failed") == 1 and d.get("timed") == 0,
+          "failed=%r timed=%r" % (d.get("failed"), d.get("timed")))
+
+    # 超时：记 timed、不记 failed
+    r, d = jrun(["gate", "8", "--timeout", "1", "--json"], 1)
+    check("gate --json 超时记进 timed 而不是 failed",
+          d.get("timed") == 1 and d.get("failed") == 0,
+          "failed=%r timed=%r" % (d.get("failed"), d.get("timed")))
+    check("gate --json 单条 check 带 timeout=true",
+          any(c.get("timeout") for c in d.get("checks", [])), repr(d.get("checks")))
+
+    # 空分支：零步骤、零 doing 时，--json 的 stdout 也必须是一个 JSON 对象，
+    # 而且「没有数据」和「数据是 0」不许混为一谈 —— totals 给 null 而不是 0，
+    # 因为 0 会被读成「一分钱没花」，null 才诚实地表示「还没有计划」。
+    bare = tempfile.mkdtemp(prefix="pljson_")
+    subprocess.run("git init -q", cwd=bare, shell=True, capture_output=True)
+    run(["init", "空计划", "--why", "验 --json 的空分支"], bare)
+    r = run(["gate", "--json"], bare)
+    d2 = json.loads(r.stdout)
+    check("没有 doing 步骤时 gate --json 仍给纯 JSON",
+          d2.get("api") == 1 and d2.get("step") is None, repr(d2)[:160])
+    check("没有可验步骤时 gate --json 的 exit 字段是 0", d2.get("exit") == 0)
+    r = run(["report", "--json"], bare)
+    check("零步骤时 report --json 的 totals 是 null 而不是 0",
+          json.loads(r.stdout)["totals"] is None)
+    r = run(["parallel", "--json"], bare)
+    check("零步骤时 parallel --json 给空批次",
+          json.loads(r.stdout)["batches"] == [])
+    # 用法错误：退出码说话，人话进 stderr，stdout 一个字都不许掺
+    r = run(["gate", "99", "--json"], bare, expect=2)
+    check("--json 下用法错误：stdout 空、stderr 有 ERROR",
+          (r.stdout or "").strip() == "" and "ERROR" in (r.stderr or ""),
+          "stdout=%r stderr=%r" % ((r.stdout or "")[:80], (r.stderr or "")[:80]))
+
+    # 会话 id 显示：同一批 subagent 的 id 前缀会撞，一律截 12 位就分不清谁是谁，
+    # 而「归属错了比不记更坏」。这两个 id 是 A/B 实测里真实撞上的那一对。
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("tollgate_tg", PL)
+    tgmod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tgmod)
+    two = ["ses_e8ce09f97ffetn6K5ggB3rw27V", "ses_e8ce09f98ffeH9jKpjw8mxL1bE"]
+    labels = tgmod.short_sids(two)
+    check("短 id 必须彼此可分（撞了要自动加长）",
+          labels[two[0]] != labels[two[1]], repr(labels))
+    check("短 id 不短于 12 位（别短到看不出是会话）",
+          all(len(v) >= 12 for v in labels.values()), repr(labels))
+    check("只有一个会话时不必加长",
+          list(tgmod.short_sids([two[0]]).values()) == [two[0][:12]])
+
     # ---------------- 收尾：reconcile 仍可用 ----------------
     r = run(["reconcile"], root, expect=0)
     check("reconcile 可用", r.returncode == 0)

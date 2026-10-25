@@ -110,6 +110,11 @@ serve [--port 7717] [--no-open]          本地只读工作台
 sync [--step N] [--dry-run] [--json]     把宿主逐轮真实用量写进账本，取代手填 spend
 ```
 
+**机器可读输出**：`status` / `parallel` / `report` / `gate` / `sync` / `ctx` 都支持 `--json`。
+每条命令的 stdout 上是**一个** JSON 对象，带 `"api": 1` 版本号；`gate --json` 失败时照样
+exit 1，`ok`/`exit` 字段与真退出码一致。编排层（`orch.py`）只吃这条契约，从不去抠人类可读
+输出里的数字——抠出来的数看着像真的，错的时候没人查得出来。
+
 ---
 
 ## 账不用手记：`tg sync`
@@ -235,6 +240,31 @@ $ tg gate 1 --timeout 1
 
 ---
 
+## 编排层 `orch`：多角色并发不炸的那一层
+
+`tg` 管「这一步做完了吗」和「花了多少钱」。当你要**几个 agent 同时干活**时，还会多出三个
+问题：谁负责哪块、并发几路、各自说的"做好了"算不算数。`orch.py` 只管这三件，它
+**不调模型、不起进程、不改计划**，只经 `subprocess` 吃 `tg` 的 `--json` 契约。
+
+```bash
+python orch.py role add backend  --dir api/ --reviewer jev    # 角色 = 一个它独占的目录
+python orch.py role add frontend --dir web/ --reviewer jev
+python orch.py fan 2                       # 派发前踩刹车，过了就一人一份自足式简报
+python orch.py rollup --gate --cost        # 收工后三层汇总：断言 / 语义 / 人
+```
+
+派发前踩的四道刹车：**并发路数**（默认 2）、**目录重叠**、**依赖链深度**（默认 3）、
+**契约文件在不在**。路数上限不是性能旋钮：Anthropic 的多 agent 系统是 15× token 换
++90.2% 且明说编码任务并行度低，MAST 查 1642 条轨迹里头号失败模式就是 cost runaway。
+
+门控分三层，**生死只由第一层决定**：断言看 `exit code`（唯一能否决 `done` 的）、
+reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三层分列打印，不会写
+「AI 评价通过」这种合体句；`jev` 的 `pass` 在人工抽查验证之前**不得**当 `done` 依据。
+
+细节（含 `review-<step>.json` 字段级格式）见 `references/orchestration.md`。
+
+---
+
 ## 本地工作台
 
 `tg serve` 起一个只绑 `127.0.0.1` 的只读看板（校验 Host 头，防 DNS rebinding），一屏看到：
@@ -321,14 +351,22 @@ $ tg gate 1 --timeout 1
 17. `reconcile` 会把**所有**已完成步骤的门禁重跑一遍，所以计划里的慢断言会成倍放大时间
     （本仓 6 个步骤实测 352 秒，其中大半是两套全量测试）。它没有缓存、没有增量——「上次
     验过」不算数，这正是不骗人的代价。要给慢断言放宽时间用 `--timeout N`（`0` = 不限时）。
+18. `tg start` 只允许**一个**步骤同时 `doing`，所以真两路并发时第二路只能绕过 `start`、
+    收工后直接 `sync --step N --session <id>`（归属仍准确，但边界退化成计划 `created`）。
+    这是绕过来，不是支持——放宽成受 `max_fanout` 约束的多值还没进内核，`orch fan`
+    每次都会把这段话打出来，不让人误以为是官方姿势。
+19. `orch rollup` 不加 `--gate` 时**不做**断言与语义的打架检测（因为 `status=done` 只说明
+    「当时过了」，代码可能已经变了），并且明说「没查」。所以默认模式的 rollup **不能**
+    当验收证据；要证据就加 `--gate`，慢但是真数据。
 
 ---
 
-## 深入文档（七份，按需读）
+## 深入文档（八份，按需读）
 
 | 文件 | 讲什么 |
 |---|---|
 | `references/gates.md` | 两道闸的守卫点、断言语法、门禁为什么拒 |
+| `references/orchestration.md` | 编排层：角色/目录边界、四道刹车、`review-*.json` 字段格式、三层门控的不变量 |
 | `references/plan-format.md` | 计划 / 账本 / 游标的字段级格式；删 `.plan/` 里哪个文件会出什么事 |
 | `references/context-budget.md` | 计费公式、缓存命中、1.5× 换手结论、预算口径 vs 钱 |
 | `references/tiers.md` | 三档判据、模型 ID 映射、用账本里的真实单轮价验证档位是否生效 |
@@ -341,18 +379,19 @@ $ tg gate 1 --timeout 1
 ## 测试
 
 ```bash
-python tests/test_tg.py        # 98 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时
+python tests/test_tg.py        # 140 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 106 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界
+python tests/test_orch.py      # 66 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态
 python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
 ```
 
-合计 **264 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据。
+合计 **372 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面四个套件，核对 README 写的项目数与合计（不计入 264）
+python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 372）
 ```
 
 ---

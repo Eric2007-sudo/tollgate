@@ -105,6 +105,10 @@ DEFAULT_BUDGET = 8000
 GATE_TIMEOUT = 600
 TIMEOUT_TAG = "cmd 超时"
 
+# `--json` 输出契约的版本号。编排层（orch）只认这个数：
+# 加字段不升版，**改字段名或改含义必须 +1**。
+JSON_API = 1
+
 TIERS = ("cheap", "std", "deep")
 
 # Ponytail 的梯子：从「不需要存在」到「必须新写」，越靠前越省钱
@@ -127,12 +131,39 @@ def out(msg=""):
 
 
 def die(msg, code=2):
-    out("ERROR: " + msg)
+    # 错误走 stderr：stdout 是 `--json` 的机器契约，混一行「ERROR: ...」进去，
+    # 下游每读一条命令都得先猜这行是不是 JSON。退出码才是失败的正式说法。
+    print("ERROR: " + msg, file=sys.stderr)
     sys.exit(code)
 
 
 def warn(msg):
     out("!! " + msg)
+
+
+def jout(payload):
+    """所有 `--json` 的唯一出口：一个 JSON 对象，带 `api` 版本号。
+
+    机器可读的输出不许掺人类提示，否则编排层每读一个命令都得猜哪几行是 JSON。
+    """
+    out(json.dumps(payload, ensure_ascii=False, indent=1))
+
+
+def short_sids(sids, min_len=12):
+    """给一组会话 id 生成「彼此可区分」的短标签。
+
+    直接截到 12 位最省事，但同一批 subagent 的 id 前缀经常撞
+    （实测 ses_e8ce09f97… 与 ses_e8ce09f98… 截断后一模一样），
+    报表里看起来就像「同一个会话记了两笔」。**归属错了比不记更坏**，
+    所以这里按需加长，最短也要能唯一。
+    """
+    sids = [s for s in sids if s]
+    longest = max((len(s) for s in sids), default=0)
+    for n in range(min_len, longest + 1):
+        labels = {s: s[:n] for s in sids}
+        if len(set(labels.values())) == len(sids):
+            return labels
+    return {s: s for s in sids}
 
 
 def now_iso():
@@ -639,11 +670,17 @@ def cmd_parallel(a):
     plan = load(root)
     remaining = [s for s in plan["steps"] if s["status"] not in ("done", "blocked")]
     if not remaining:
+        if a.json:
+            jout({"api": JSON_API, "cmd": "parallel", "ok": True,
+                  "plan_id": plan["id"], "batches": [], "conflicts": [],
+                  "stuck": [], "max_fanout": 0, "remaining": 0})
+            return
         out("没有剩余步骤。")
         return
     done = set(s["n"] for s in plan["steps"] if s["status"] == "done")
     batches = []
     placed = set(done)
+    stuck = []
     guard = 0
     while True:
         guard += 1
@@ -665,7 +702,8 @@ def cmd_parallel(a):
             batch.append(s)
         if not batch:
             rest = [s for s in remaining if s["n"] not in placed]
-            if rest:
+            stuck = [s["n"] for s in rest]
+            if rest and not a.json:
                 out("无法继续排序（依赖成环或缺依赖）：%s"
                     % "、".join("#%d" % s["n"] for s in rest))
             break
@@ -673,16 +711,40 @@ def cmd_parallel(a):
         for s in batch:
             placed.add(s["n"])
 
+    conflicts = []
+    for batch in batches:
+        for j in range(len(batch)):
+            for k in range(j + 1, len(batch)):
+                if paths_overlap(batch[j].get("out", ""), batch[k].get("out", "")):
+                    conflicts.append([batch[j]["n"], batch[k]["n"]])
+
+    if a.json:
+        jout({
+            "api": JSON_API, "cmd": "parallel", "ok": True,
+            "plan_id": plan["id"],
+            "batches": [{
+                "batch": i,
+                "steps": [{"n": s["n"], "title": s["title"], "tier": s["tier"],
+                           "out": s.get("out", ""),
+                           "depends": list(s.get("depends", []))}
+                          for s in batch],
+            } for i, batch in enumerate(batches, 1)],
+            "conflicts": conflicts,
+            "stuck": stuck,
+            "max_fanout": max((len(b) for b in batches), default=0),
+            "remaining": len(remaining),
+        })
+        return
+
     for i, batch in enumerate(batches, 1):
         head = "批次 %d（%d 个可同时跑）:" % (i, len(batch)) if len(batch) > 1 \
             else "批次 %d（单步，无可并行的同伴）:" % i
         out(head)
         for s in batch:
             out("  #%d %s  →  %s" % (s["n"], s["title"], s.get("out", "-")))
-        for j in range(len(batch)):
-            for k in range(j + 1, len(batch)):
-                if paths_overlap(batch[j].get("out", ""), batch[k].get("out", "")):
-                    out("  !! #%d 与 #%d 产物重叠，不能真并行" % (batch[j]["n"], batch[k]["n"]))
+        for na, nb in conflicts:
+            if na in [x["n"] for x in batch] and nb in [x["n"] for x in batch]:
+                out("  !! #%d 与 #%d 产物重叠，不能真并行" % (na, nb))
     out("")
     out("提示：并行只对「产物不重叠」的步骤安全。改同一批文件的步骤必须串行。")
 
@@ -955,11 +1017,37 @@ def cmd_gate(a):
         if s is None:
             todos = [x for x in plan["steps"] if x["status"] == "todo"]
             if not todos:
+                if a.json:
+                    # 没有可验的步骤不是错误，但也不能什么都不输出：
+                    # `--json` 的 stdout 永远得是一个 JSON 对象。
+                    jout({"api": JSON_API, "cmd": "gate", "ok": True,
+                          "step": None, "title": None, "checks": [],
+                          "passed": 0, "failed": 0, "timed": 0,
+                          "timeout_limit": a.timeout, "exit": 0,
+                          "note": "没有 doing 的步骤。全部 done 或未开始。"})
+                    return
                 out("没有 doing 的步骤。全部 done 或未开始。")
                 sys.exit(0)
             s = todos[0]
 
     results, failed, timed, text = gate_report(root, s, plan, timeout=a.timeout)
+
+    if a.json:
+        jout({
+            "api": JSON_API, "cmd": "gate", "ok": not (failed or timed),
+            "step": s["n"], "title": s["title"],
+            "checks": [{"expr": e, "ok": bool(ok),
+                        "timeout": bool((not ok) and is_timeout(d)),
+                        "detail": d} for e, ok, d in results],
+            "passed": sum(1 for _, ok, _ in results if ok),
+            "failed": failed, "timed": timed,
+            "timeout_limit": a.timeout,
+            "exit": 1 if (failed or timed) else 0,
+        })
+        if failed or timed:
+            sys.exit(1)
+        return
+
     out(text)
 
     drift = git_drift(root, plan.get("git_head"))
@@ -1051,6 +1139,48 @@ def cmd_status(a):
     cur = next((s for s in steps if s["status"] == "doing"), None) \
         or next((s for s in steps
                  if s["status"] == "todo" and _deps_done(plan, s)[0]), None)
+
+    if a.json:
+        tot_cost, _ = cost_for(ledger)
+        jout({
+            "api": JSON_API, "cmd": "status", "ok": True,
+            "plan": {"id": plan["id"], "goal": plan["goal"],
+                     "why": plan.get("why", ""),
+                     "created": plan.get("created", ""),
+                     "updated": plan.get("updated", ""),
+                     "schema": plan.get("schema", SCHEMA),
+                     "git_head": plan.get("git_head", "")},
+            "progress": {"done": done, "total": total,
+                         "budget": budget, "spent": spent, "pct": pct,
+                         "blocked": len(blocked),
+                         "reqs": reqs_for(ledger),
+                         "cost_usd": tot_cost},
+            "current": ({"n": cur["n"], "title": cur["title"],
+                         "tier": cur["tier"], "out": cur.get("out", ""),
+                         "status": cur["status"],
+                         "rounds": cur.get("rounds", 0),
+                         "budget": cur.get("budget", 0)} if cur else None),
+            # 多个步骤同时在跑时这里会有多个号 —— C1 把 doing 从单值放宽后，
+            # 编排层就靠这个字段知道「现在到底谁在干活」。
+            "doing": [s["n"] for s in steps if s["status"] == "doing"],
+            "steps": [{
+                "n": s["n"], "title": s["title"], "status": s["status"],
+                "tier": s["tier"], "out": s.get("out", ""),
+                "budget": s.get("budget", 0), "spent": spent_for(ledger, s["n"]),
+                "reqs": reqs_for(ledger, s["n"]),
+                "budget_rounds": s.get("budget_rounds", 0),
+                "rounds": s.get("rounds", 0),
+                "depends": list(s.get("depends", [])),
+                "cost_usd": cost_for(ledger, s["n"])[0],
+                "accept": list(s.get("accept", [])),
+                "stop": list(s.get("stop", [])),
+                "note": s.get("note", ""),
+            } for s in steps],
+            "exclude": list(plan.get("exclude") or []),
+            "blocked": [{"n": s["n"], "title": s["title"],
+                         "note": s.get("note", "")} for s in blocked],
+        })
+        return
 
     goal = plan["goal"]
     if len(goal) > 46:
@@ -1355,17 +1485,110 @@ def cmd_reconcile(a):
         sys.exit(1)
 
 
+def _report_payload(plan, ledger, steps, total_budget, total_spent):
+    """`tg report --json` 的数据体。
+
+    口径与文字版**逐项相同**（同一个 spent_for / reqs_for / cost_for），
+    不另算一套数字 —— 两套算法迟早会打架，而报表打架比报表难看严重得多。
+    """
+    total_reqs = reqs_for(ledger)
+    tot_cost, cost_rows = cost_for(ledger)
+    est_rows = [r for r in ledger if r.get("cost_est") and r.get("cost")]
+
+    by_tier = {}
+    for s in steps:
+        t = by_tier.setdefault(s["tier"], {"steps": 0, "budget": 0, "spent": 0})
+        t["steps"] += 1
+        t["budget"] += s.get("budget", 0)
+        t["spent"] += spent_for(ledger, s["n"])
+    for t in by_tier.values():
+        t["share_pct"] = round(t["spent"] / total_spent * 100, 1) if total_spent else 0.0
+
+    steps_out = []
+    for s in steps:
+        used = spent_for(ledger, s["n"])
+        r = reqs_for(ledger, s["n"])
+        b = s.get("budget", 0)
+        if b and used:
+            ratio = used / b
+            verdict = "over" if ratio > 1.5 else (
+                "under" if (ratio < 0.3 and s["status"] == "done") else "ok")
+        else:
+            ratio, verdict = None, "none"
+        steps_out.append({
+            "n": s["n"], "title": s["title"], "status": s["status"],
+            "tier": s["tier"], "reuse": s.get("reuse") or "?",
+            "budget": b, "spent": used,
+            "budget_ratio": (round(ratio, 3) if ratio is not None else None),
+            "budget_verdict": verdict,
+            "reqs": r, "budget_rounds": s.get("budget_rounds", 0),
+            "per_round": (int(used / r) if r else None),
+            "cost_usd": cost_for(ledger, s["n"])[0],
+            "budget_rounds_over": bool(s.get("budget_rounds")) and r > s["budget_rounds"],
+        })
+
+    rungs = {}
+    for s in steps:
+        k = s.get("reuse") or "?"
+        rungs[k] = rungs.get(k, 0) + 1
+    rated = len(steps) - rungs.get("?", 0)
+    new_n = rungs.get("new", 0)
+
+    status = {}
+    for st in ("done", "doing", "todo", "blocked"):
+        n = sum(1 for s in steps if s["status"] == st)
+        if n:
+            status[st] = n
+
+    return {
+        "api": JSON_API, "cmd": "report", "ok": True,
+        "plan_id": plan["id"], "goal": plan["goal"],
+        "totals": {
+            "budget": total_budget, "spent": total_spent,
+            "pct": (int(total_spent / total_budget * 100) if total_budget else 0),
+            "reqs": total_reqs,
+            "budget_rounds": sum(s.get("budget_rounds", 0) for s in steps),
+            "baseline_context": plan.get("baseline_context") or 0,
+            "per_round": (int(total_spent / total_reqs) if total_reqs else None),
+            "cost_usd": tot_cost, "cost_rows": cost_rows,
+            "cost_est_rows": len(est_rows),
+            "cost_est_usd": (round(sum(float(r["cost"]) for r in est_rows), 12)
+                             if est_rows else None),
+        },
+        "by_tier": by_tier,
+        # 会话 id 给**全长**：编排层要拿它去 tg sync --session 续账，
+        # 截断过的 id 是废的。人看的短标签由文字版负责。
+        "by_session": [{"session": sid, "usd": g["usd"], "rows": g["rows"],
+                        "reqs": g["reqs"]} for sid, g in cost_by_session(ledger)],
+        "steps": steps_out,
+        "reuse": {"rungs": rungs, "rated": rated, "new": new_n,
+                  "rate_pct": (int((rated - new_n) / rated * 100) if rated else None)},
+        "status": status,
+    }
+
+
 def cmd_report(a):
     root = find_root()
     plan = load(root)
     ledger = load_ledger(root)
     steps = plan["steps"]
     if not steps:
+        if a.json:
+            jout({"api": JSON_API, "cmd": "report", "ok": True,
+                  "plan_id": plan["id"], "goal": plan["goal"],
+                  "totals": None, "by_tier": {}, "by_session": [],
+                  "steps": [], "reuse": {"rungs": {}, "rated": 0, "new": 0,
+                                         "rate_pct": None}, "status": {}})
+            return
         out("还没有步骤。")
         return
 
     total_budget = sum(s.get("budget", 0) for s in steps)
     total_spent = sum(r.get("in", 0) + r.get("out", 0) for r in ledger)
+
+    if a.json:
+        jout(_report_payload(plan, ledger, steps, total_budget, total_spent))
+        return
 
     out("== 成本 ==")
     out("  预算 %s ｜ 实耗 %s（%d%%）"
@@ -1449,7 +1672,9 @@ def cmd_report(a):
         known = [(sid, g) for sid, g in groups if sid]
         unknown = next((g for sid, g in groups if not sid), None)
         if len(known) > 1 or (known and unknown):
-            parts = ["%s $%.6f（%d 笔 / %d 轮）" % (sid[:12], g["usd"], g["rows"], g["reqs"])
+            labels = short_sids([sid for sid, _ in known])
+            parts = ["%s $%.6f（%d 笔 / %d 轮）"
+                     % (labels.get(sid, sid), g["usd"], g["rows"], g["reqs"])
                      for sid, g in known]
             if unknown:
                 parts.append("没有会话 id 的旧行 $%.6f（%d 笔，v0.2 之前写的，不猜）"
@@ -2848,6 +3073,7 @@ def main():
     p.set_defaults(fn=cmd_ready)
 
     p = sub.add_parser("parallel", help="按依赖与产物冲突切并行批次")
+    p.add_argument("--json", action="store_true", help="机器可读输出")
     p.set_defaults(fn=cmd_parallel)
 
     p = sub.add_parser("graph", help="打印依赖图")
@@ -2881,6 +3107,7 @@ def main():
     p.add_argument("--timeout", type=int, default=GATE_TIMEOUT,
                    help="每条 cmd: 断言最多跑几秒（超时算「没验完」，不算通过；0 = 不限时；默认 %d）"
                         % GATE_TIMEOUT)
+    p.add_argument("--json", action="store_true", help="机器可读输出")
     p.set_defaults(fn=cmd_gate)
 
     p = sub.add_parser("done", help="标记完成（gate 不通过会拒绝）")
@@ -2902,6 +3129,7 @@ def main():
     p.set_defaults(fn=cmd_reconcile)
 
     p = sub.add_parser("report", help="成本 / 预算准确性 / 复用率报表")
+    p.add_argument("--json", action="store_true", help="机器可读输出")
     p.set_defaults(fn=cmd_report)
 
     p = sub.add_parser("ack", help="人工确认一条 ack: 断言")
@@ -2909,6 +3137,7 @@ def main():
     p.set_defaults(fn=cmd_ack)
 
     p = sub.add_parser("status", help="状态摘要（≤150 token）")
+    p.add_argument("--json", action="store_true", help="机器可读输出")
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("show", help="打印完整计划")

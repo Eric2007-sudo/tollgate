@@ -59,8 +59,8 @@ if ((Test-Path $dest) -and ($src -ne $dest)) {
 if ($src -ne $dest) {
     New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
-    # 只复制运行所需：SKILL.md + tg.py + ui/ + references/
-    foreach ($f in @("SKILL.md", "tg.py")) {
+    # 只复制运行所需：SKILL.md + tg.py + orch.py + ui/ + references/
+    foreach ($f in @("SKILL.md", "tg.py", "orch.py")) {
         $s = Join-Path $src $f
         if (Test-Path $s) { Copy-Item $s -Destination $dest -Force }
     }
@@ -100,6 +100,8 @@ if ($python) {
     Write-Host "可用。调用前缀：" -ForegroundColor Green
     Write-Host "  python `"$tg`""
     Write-Host "  python `"$tg`" serve --port 7717    # 本地工作台"
+    Write-Host "  python `"$(Join-Path $dest 'orch.py')`"" -ForegroundColor Green
+    Write-Host "  python `"$(Join-Path $dest 'orch.py')`" fan 2    # 多角色编排（不调模型）"
 } else {
     Write-Host "未找到 python。技能文件已就位，但 CLI 需要 Python 3.8+。" -ForegroundColor Yellow
 }
