@@ -1274,9 +1274,30 @@ def cmd_report(a):
             rows.append((s, r, spent_for(ledger, s["n"])))
         for s, r, used in rows:
             br = s.get("budget_rounds", 0)
-            out("  #%d %d 轮%s ｜ 单轮 %s ｜ 实耗 %s"
+            c, _ = cost_for(ledger, s["n"])
+            out("  #%d %d 轮%s ｜ 单轮 %s ｜ 实耗 %s%s"
                 % (s["n"], r, ("/%d" % br) if br else "",
-                   fmt_k(int(used / r)), fmt_k(used)))
+                   fmt_k(int(used / r)), fmt_k(used),
+                   (" ｜ %s" % money(c)) if c is not None else ""))
+
+    out("")
+    out("== 钱（账本里的真实 cost）==")
+    tot, cnt = cost_for(ledger)
+    if tot is None:
+        out("  账本里没有 cost。跑 tg sync 让宿主自己报账；")
+        out("  手记 spend 时是记不到钱的（它只有 token 数），别把 token 数当钱。")
+    else:
+        est = [r for r in ledger if r.get("cost_est") and r.get("cost")]
+        est_tot = sum(float(r["cost"]) for r in est)
+        rounds = sum(r.get("reqs", 0) for r in ledger if r.get("cost"))
+        out("  %s ｜ %d 笔记账 / %d 轮" % (money(tot), cnt, rounds))
+        if rounds:
+            out("  单轮 %s" % money(tot / rounds))
+        if est:
+            out("  其中 %s 来自 %d 笔按本地单价重算（宿主没写 cost，真实值只会更低）"
+                % (money(est_tot), len(est)))
+        if not est:
+            out("  全部来自宿主记录，不是估算。")
 
     out("")
     out("== 预算准确性 ==")
@@ -1994,6 +2015,20 @@ def save_sync(root, data):
     }
     with open(p, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1)
+
+
+def cost_for(ledger, n=None):
+    """账本里某步（或全部）真实记录的钱。没有 cost 的记录不计入，返回 (金额, 笔数)。"""
+    tot, cnt = 0.0, 0
+    for r in ledger:
+        if n is not None and r.get("step") != n:
+            continue
+        c = r.get("cost")
+        if not c:
+            continue
+        tot += float(c)
+        cnt += 1
+    return (tot, cnt) if cnt else (None, 0)
 
 
 def cmd_sync(a):

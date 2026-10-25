@@ -268,6 +268,24 @@ def main():
            % (d or {}).get("fresh"))
     expect(sync_state(tmp7).get("session") == "ses_other", "游标跟着换到新会话")
 
+    # ---------- 11. report 里能看见真实钱，而不是只有 token ----------
+    tmp8 = case("11 report 显示真实账", TURNS3)
+    run(tmp8, ["sync"])
+    r = run(tmp8, ["report"])
+    body = r.stdout + r.stderr
+    expect(r.returncode == 0, "report 正常结束")
+    expect("$0.000900" in body, "report 里出现宿主记录的真实金额 $0.000900")
+    expect("全部来自宿主记录" in body, "report 明说这笔钱不是估算的")
+    expect("账本里没有 cost" not in body, "有 cost 时不再提示「没有 cost」")
+
+    # ---------- 12. 只有 token 没有钱时，report 不许把 token 当钱 ----------
+    tmp9 = case("12 只有 token 没有钱", TURNS3)
+    run(tmp9, ["spend", "1", "--in", "3000", "--out", "300", "--reqs", "2"])
+    r = run(tmp9, ["report"])
+    body = r.stdout + r.stderr
+    expect("账本里没有 cost" in body, "report 明说账本里没有 cost")
+    expect("tg sync" in body, "并指路到 sync")
+
     print("\n" + ("全绿。" if not FAILED else "失败 %d 项：" % len(FAILED)))
     for m in FAILED:
         print("  - " + m)
