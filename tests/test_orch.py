@@ -279,7 +279,8 @@ def main():
     check("简报点名契约文件（共同的唯一事实来源）", "contract/CONTRACT.md" in body)
     check("简报列了别的角色的目录作为禁区", "web/" in body)
     check("简报带会真跑的验收断言", "file:exists:api/app.py" in body)
-    check("简报给了归账命令", "tg sync --step 2 --session" in body)
+    check("简报给出归账命令，但明说那是给上层抄的（子会话自己跑就是记错账）",
+          "tg sync --step 2 --session" in body and "你不要自己归账" in body)
     check("简报明说不要自己 tg done", "不要**自己调 `tg done`" in body)
     check("简报要求偏离契约时停下来汇报", "停下来汇报" in body)
     check("简报写死了这一路具体做什么（不是让人自己猜）",
