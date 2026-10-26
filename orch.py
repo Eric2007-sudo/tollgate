@@ -124,6 +124,53 @@ def paths_overlap(a, b):
     return a.startswith(b + "/") or b.startswith(a + "/")
 
 
+def dir_disp(root, d):
+    """角色的 `--dir` 怎么显示 —— `ui/` 加斜杠，`tg.py` 不加。
+
+    以前一律 `{dir}/`，于是单文件角色的简报上写着「不许读改 `tg.py/`」——
+    一个不存在的目录。真按它办事的 agent 会以为那个文件不在禁区里。
+    判据只认盘上是什么，不认名字里有没有点（`v1.0/` 也是目录）。
+    """
+    d = str(d or "").replace("\\", "/").strip().strip("/")
+    if not d:
+        return d
+    try:
+        if (root / d).is_file():
+            return d
+    except OSError:
+        pass
+    return d + "/"
+
+
+def accept_targets(x):
+    """一条断言里点名了哪些路径。认不出来就返回空（= 这条算整步的）。"""
+    s = (x or "").strip()
+    if not s:
+        return []
+    if s.startswith(("grep:", "nogrep:")):
+        return [s.rsplit("@", 1)[1].strip()] if "@" in s else []
+    if s.startswith(("file:exists:", "file:absent:")):
+        return [s.split(":", 2)[2].strip()]
+    if s.startswith(("cmd:", "ack:")):
+        # 命令行里点名了哪个目录/文件，那条就算谁的
+        body = s.split(":", 1)[1]
+        toks = [t for t in re.split(r"[\s\"'=|&;]+", body) if t]
+        return [t for t in toks if "/" in t or "." in t]
+    return re.findall(r"[A-Za-z0-9_.\-/]+\.[A-Za-z0-9]+", s)
+
+
+def accept_owner(roles, x):
+    """这条断言归哪一路：返回角色名；认不出是谁的产物就返回 ""（整步级）。"""
+    for t in accept_targets(x):
+        for name, info in roles.items():
+            if paths_overlap(info["dir"], t) or \
+               str(info["dir"]).replace("\\", "/").strip("/") == \
+               t.replace("\\", "/").strip("/"):
+                return name
+        # 同一个目标被多个角色覆盖时上面已经返回，这里只剩「没人认领」
+    return ""
+
+
 def chain_depth(steps, n):
     """这一步的依赖链有多深（#1 的深度为 1）。有环就返回 -1。"""
     by = {s["n"]: s for s in steps}
@@ -280,8 +327,8 @@ def cmd_role_add(a):
     if merge:
         st["merge"] = merge
     save_roles(root, st)
-    out("已登记角色 %s → %s/（reviewer=%s%s）"
-        % (name, d, a.reviewer,
+    out("已登记角色 %s → %s（reviewer=%s%s）"
+        % (name, dir_disp(root, d), a.reviewer,
            "，lead=大脑" if (a.lead and not drop_lead) else ("，已撤销大脑" if drop_lead else "")))
     if a.reviewer == "startlux":
         out("  注意：startlux 的 key 还没接上时它只是个空位，别当它能评。")
@@ -327,7 +374,7 @@ def cmd_role_list(a):
     out("角色（%d 个，并发上限 %d 路）:" % (len(roles), st["max_fanout"]))
     for k, v in roles.items():
         out("  %-12s → %-20s reviewer=%s%s%s"
-            % (k, v.get("dir", "-") + "/", v.get("reviewer", "-"),
+            % (k, dir_disp(root, v.get("dir", "")) or "-", v.get("reviewer", "-"),
                "  ← 大脑" if k == (st.get("lead") or "") else "",
                ("   # " + v["note"]) if v.get("note") else ""))
         out("  %-12s   %s" % ("", ("做什么：" + v["task"]) if v.get("task")
@@ -336,7 +383,7 @@ def cmd_role_list(a):
     out("开工七问：")
     out("  ① 并发几路        ≤ %d 路（%d 个角色已登记）" % (st["max_fanout"], len(roles)))
     out("  ② 哪个是大脑      %s" % (st.get("lead") or "（没定 → fan 会拒）"))
-    out("  ③ 几个角色/各碰哪 %s" % "、".join("%s→%s/" % (k, v.get("dir", "-"))
+    out("  ③ 几个角色/各碰哪 %s" % "、".join("%s→%s" % (k, dir_disp(root, v.get("dir", "")) or "-")
                                           for k, v in roles.items()))
     miss = [k for k, v in roles.items() if not (v.get("task") or "").strip()]
     out("  ④ 每路做什么      %s" % ("都写了" if not miss else "缺：" + "、".join(miss)))
@@ -356,7 +403,7 @@ BRIEF_TMPL = """# 简报 · #{n} {title} · 角色 `{role}`
 
 ## 你只能碰这一个目录
 
-`{dir}/`
+`{dir_disp}`
 
 **不许读、不许改**这些地方（它们是别的角色/别组的产物，读了就等于用别人的中间状态污染判断）：
 {forbidden}
@@ -377,20 +424,26 @@ BRIEF_TMPL = """# 简报 · #{n} {title} · 角色 `{role}`
 
 ## 这一步的边界
 
-- 产物目录：`{out}`
-- 请求轮数上限：{rounds}
-- 停止条件：{stops}
-- 你正在做的步骤：`#{n} {title}`
+- **你这一路只能产出在 `{dir_disp}`** —— 越过这条就算失败，断言全绿也不算。
+- 这一路的请求轮数上限：{rounds}
+- 你正在做的步骤：`#{n} {title}`（整步产物目录：`{out_disp}`；那是步骤级的，
+  有时候写的是别的路的名字，**别拿它当你的边界**）
+- 步骤级停止条件（**对所有角色一样**；里面对某个角色点名的那句只对那个角色生效，
+  不是给你的）：{stops}
 
 ## 验收断言（会真跑；exit code 才是生死）
 
-{accept}
+**你这一路必须自己跑绿的**（断言点名的是 `{dir_disp}`）：
+{accept_own}
+
+**整步断言**（别的路也在里面：你跑不过不等于你没做完，但整步就过不了闸）：
+{accept_step}
 
 通不过就是没做完。不要用「应该可以了」代替跑一遍。
 
 ## 收工怎么算
 
-1. 跑 `{cmd_gate}`，必须全绿；
+1. 跑 `{cmd_gate}`：断言里**属于这一路的**必须全绿；整步还差别的路的活，不算你没做完；
 2. 把它记进账：`{cmd_sync}`；
 3. 你**不要**自己调 `tg done`，交给上层。
 
@@ -501,12 +554,25 @@ def cmd_fan(a):
              "    两路塞进同一个会话是最坏的情况：轮次混在一起，点谁的名都是猜。"
              % DEFAULT_MAX_FANOUT)
 
+    # 步骤级 stop 里点名某个角色时，另外几路读到的那句是噪音 —— 明说出来。
+    # 上一轮真跑的简报里，tester 的边界上挂着「前端拿不到契约里的字段就停下来」，
+    # 那是 frontend 的刹车。抄在某一路名下，人就会以为这条是给它的。
+    for s_txt in (step.get("stop") or []):
+        named = [r for r in roles if r in s_txt]
+        if named and len(named) < len(roles):
+            warn("停止条件点了 %s 的名：另外几路读到的那句不对它们生效（简报里已标成步骤级）。"
+                 "要每路各有刹车，就写成不点名的，或者拆成两步。" % "、".join(named))
+
     # ⑥ 生成简报
     bdir = orch_dir(root) / "briefs"
     bdir.mkdir(parents=True, exist_ok=True)
-    accept = "\n".join("- `%s`" % x for x in (step.get("accept") or [])) \
-        or "- （这步没有断言 → 它没有验证价值，先补 --accept）"
+    all_accept = list(step.get("accept") or [])
     stops = "；".join(step.get("stop") or []) or "（未设置 → 建议补：现实与计划不符时停下来汇报）"
+
+    # 断言按「点名了谁的目录」分给各路。全部塞给每个人的那种写法有个真实代价：
+    # 一路的简报里有另一路正在同批写的测试，于是「先跑通自己那一路」事实上不可能，
+    # agent 只能要么越界去修别人的目录，要么报告「我这边过不了闸」。
+    own_of = {x: accept_owner(st["roles"], x) for x in all_accept}
 
     briefs = {}
     for role in roles:
@@ -517,23 +583,37 @@ def cmd_fan(a):
         for other, info in st["roles"].items():
             if other == role:
                 continue
-            forbid.append("- `%s/`（角色 %s%s）"
-                          % (info["dir"], other,
+            forbid.append("- `%s`（角色 %s%s）"
+                          % (dir_disp(root, info["dir"]), other,
                              "，正在同批并发" if other in roles else ""))
         forbid.append("- `.plan/`、`.orch/`（账本与编排状态，只读不写）")
         forbid.append("- 契约文件本身（不够用就停下来汇报）")
+
+        own = [x for x in all_accept if own_of[x] == role]
+        rest = [x for x in all_accept if own_of[x] != role]
+        own_md = "\n".join("- `%s`" % x for x in own) or \
+            ("- （一条都没有 → 说明这步没有任何断言能验证这一路的产物：**停下来汇报**，"
+             "别自己加断言、也别去改别人的目录）")
+        rest_md = "\n".join(
+            "- `%s`%s" % (x, ("（这条归 `%s` 那一路）" % own_of[x]) if own_of[x] else "")
+            for x in rest) or "- （没有整步断言）"
+        if not all_accept:
+            own_md = "- （这步没有断言 → 它没有验证价值，先补 `--accept`）"
+            rest_md = "- （同上）"
+
         body = BRIEF_TMPL.format(
             n=step["n"], title=step["title"], role=role,
-            dir=st["roles"][role]["dir"],
+            dir_disp=dir_disp(root, st["roles"][role]["dir"]),
             task=st["roles"][role].get("task") or "（没写 —— 停下来要一句话再动手）",
             forbidden="\n".join(forbid),
             contract=("`%s`（先完整读一遍）" % contract) if contract
             else "**没有契约文件** —— 先停下来要一份，别自己发明字段名。",
-            out=step.get("out") or "-",
+            out_disp=dir_disp(root, step.get("out") or "-"),
             rounds=(("%d 轮" % step["budget_rounds"]) if step.get("budget_rounds")
                     else "未设（建议补 --rounds）"),
             stops=stops,
-            accept=accept,
+            accept_own=own_md,
+            accept_step=rest_md,
             cmd_gate="tg gate %d" % step["n"],
             cmd_sync="tg sync --step %d --session <你自己的会话 id>" % step["n"],
         )
@@ -554,8 +634,11 @@ def cmd_fan(a):
     preflight = {
         "fanout": {"count": len(roles), "limit": limit},
         "lead": lead,
-        "routes": [{"role": r, "dir": st["roles"][r]["dir"] + "/",
-                    "task": st["roles"][r].get("task", "")} for r in roles],
+        "routes": [{"role": r, "dir": dir_disp(root, st["roles"][r]["dir"]),
+                    "task": st["roles"][r].get("task", ""),
+                    "own_asserts": [x for x in all_accept if own_of[x] == r],
+                    "step_asserts": [x for x in all_accept if own_of[x] != r]}
+                   for r in roles],
         "merge": merge,
         # 后两问由工具答：命令是固定的，不需要人去发明一套「怎么看进度」
         "observe": ["tg status", "orch rollup", "tg serve（只读看板，只绑 127.0.0.1）"],
@@ -570,7 +653,7 @@ def cmd_fan(a):
             "max_fanout": limit, "roles": roles, "briefs": briefs,
             "contract": contract, "preflight": preflight,
             "warnings": list(WARNINGS),
-            "dispatch": [{"role": r, "dir": st["roles"][r]["dir"] + "/",
+            "dispatch": [{"role": r, "dir": dir_disp(root, st["roles"][r]["dir"]),
                           "brief": briefs[r],
                           "gate_cmd": ["gate", str(step["n"]), "--json"],
                           "sync_cmd": ["sync", "--step", str(step["n"]),
@@ -584,7 +667,7 @@ def cmd_fan(a):
     out("  ② 哪个是大脑      %s" % lead)
     for r in roles:
         out("  ③ %-12s 只碰 %-12s ④ %s"
-            % (r, st["roles"][r]["dir"] + "/", st["roles"][r].get("task", "")))
+            % (r, dir_disp(root, st["roles"][r]["dir"]), st["roles"][r].get("task", "")))
     out("  ⑤ 谁合/合不上     %s" % merge)
     out("  ⑥ 怎么观察进度    tg status（谁在 doing）· orch rollup（三层分列）· tg serve（只读看板）")
     out("  ⑦ 怎么算跑通      tg gate %d 的 exit code 为 0 —— 概率和账本都不算" % step["n"])
@@ -592,8 +675,8 @@ def cmd_fan(a):
     out("已生成 %d 份简报（#%d %s，依赖深度 %d，并发上限 %d 路）："
         % (len(briefs), step["n"], step["title"], depth, limit))
     for role in roles:
-        out("  %-12s %s   （只碰 %s/）"
-            % (role, briefs[role], st["roles"][role]["dir"]))
+        out("  %-12s %s   （只碰 %s）"
+            % (role, briefs[role], dir_disp(root, st["roles"][role]["dir"])))
     out("")
     out("接下来（orch 不替你派 agent —— 它不调模型、不管进程）：")
     out("  1. 用上面每份简报的全文，各开一个 subagent（同一批工具调用里发出去才是真并发）")
@@ -873,7 +956,7 @@ def main():
     a = ap.parse_args()
 
     if getattr(a, "version", False) or not a.cmd:
-        out("orch 0.2.0（tg --json api %d）  零依赖 · 不调模型 · 不管进程"
+        out("orch 0.2.1（tg --json api %d）  零依赖 · 不调模型 · 不管进程"
             % TG_JSON_API)
         if not a.cmd:
             ap.print_help()

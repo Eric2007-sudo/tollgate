@@ -295,6 +295,43 @@ def main():
           "tg status" in r.stdout and "tg serve" in r.stdout
           and "tg gate 2 的 exit code 为 0" in r.stdout)
 
+    # ---------------- 简报的三处「写错人」（第 10–11 步真跑七问时撞出来的）----------------
+    # 这三条的共同点是：句子本身都对，主语错了。主语错的简报比没有简报更坏 ——
+    # agent 会按它办事，并且办得很对，只是办的是别人的活。
+    with open(os.path.join(root, "tg.py"), "w", encoding="utf-8") as fh:
+        fh.write("x = 1\n")
+    r = oc(["role", "add", "kernel", "--dir", "tg.py", "--reviewer", "none"], root)
+    check("单文件角色显示成 `tg.py`，不是不存在的目录 `tg.py/`",
+          "tg.py（" in r.stdout and "tg.py/" not in r.stdout, r.stdout[:300])
+    r = oc(["role", "list"], root)
+    check("role list 对单文件角色也不加斜杠（否则禁区列表里列出的是个假目录）",
+          "tg.py" in r.stdout and "tg.py/" not in r.stdout, r.stdout[:600])
+
+    tg(["amend", "2", "--add-stop", "frontend 拿不到契约里的字段就停下来汇报"], root)
+    r = oc(["fan", "2", "--roles", "backend,frontend"], root)
+    body = read_text(b1)
+    fb = read_text(b2)
+    check("简报把「你这一路的产物目录」和步骤级 out 分开写",
+          "你这一路只能产出在 `api/`" in body and "整步产物目录：`api/`" in body
+          and "别拿它当你的边界" in body, body[:1600])
+    check("步骤的 out 不会变成别人那一路的边界（frontend 的边界仍是 web/）",
+          "你这一路只能产出在 `web/`" in fb and "整步产物目录：`api/`" in fb,
+          fb[:1600])
+    check("步骤级停止条件标成「对所有角色一样」，不冒充别人那一路的刹车",
+          "步骤级停止条件（**对所有角色一样**" in fb, fb[:1600])
+    check("停止条件点名某个角色时当场警告（不然另外几路上挂着一句不对它生效的刹车）",
+          "停止条件点了" in r.stderr and "frontend" in r.stderr, r.stderr[:400])
+    check("验收断言按「点名了谁的目录」分给各路，不是整份塞给每个人",
+          "**你这一路必须自己跑绿的**" in body
+          and "file:exists:api/app.py" in body.split("**整步断言**")[0],
+          body[:2200])
+    check("别人那一路的断言明说归谁，不让人以为自己跑不过是没做完",
+          "（这条归 `backend` 那一路）" in fb, fb[:2200])
+    check("这一路一条自己的断言都没有时，明说「停下来汇报」而不是让它自己编一条",
+          "一条都没有" in fb, fb[:2200])
+    check("收工那一步也说清楚：整步还没绿不等于这一路没做完",
+          "整步还差别的路的活，不算你没做完" in fb, fb[:2600])
+
     # --json 纯度：stdout 只有 JSON，警告走 stderr 也进 payload
     r = oc(["fan", "2", "--roles", "backend,frontend", "--json"], root,
            must_err="doing")
@@ -424,6 +461,31 @@ def main():
 
     r = oc(["--version"], root, must="不调模型")
     check("--version 把定位写清楚（不调模型、不管进程）", "不管进程" in r.stdout)
+
+    # 认「这条断言归谁」的规则本身也要钉住：归错了比不写更坏 ——
+    # 一路把别人的测试当成自己的验收标准，只能越界去修，或者报「我这边过不了闸」。
+    sys.path.insert(0, BASE)
+    import orch as _orch
+    from pathlib import Path as _P
+    rs = {"backend": {"dir": "api"}, "tester": {"dir": "tests"},
+          "kernel": {"dir": "tg.py"}}
+    check("cmd 断言按命令里点名的目录归路（tester 的测试不算给所有人）",
+          _orch.accept_owner(rs, "cmd:python tests/smoke_serve.py") == "tester",
+          repr(_orch.accept_owner(rs, "cmd:python tests/smoke_serve.py")))
+    check("grep 断言按 @ 后面的文件归路",
+          _orch.accept_owner(rs, "grep:api_reviews@api/app.py") == "backend")
+    check("单文件角色也能认领文件断言（`tg.py` 这个角色不等于任何目录）",
+          _orch.accept_owner(rs, "cmd:python -m py_compile tg.py") == "kernel",
+          repr(_orch.accept_owner(rs, "cmd:python -m py_compile tg.py")))
+    check("认不出归属的断言算整步，不硬塞给某一路",
+          _orch.accept_owner(rs, "cmd:python -m py_compile") == "",
+          repr(_orch.accept_owner(rs, "cmd:python -m py_compile")))
+    check("人肉验收（ack）里没点名路径时算整步", 
+          _orch.accept_owner(rs, "ack:人看过面板了") == "")
+    check("dir_disp 只给真目录加斜杠（盘上是什么就是什么，不看名字里有没有点）",
+          _orch.dir_disp(_P(root), "api") == "api/"
+          and _orch.dir_disp(_P(root), "tg.py") == "tg.py",
+          repr(_orch.dir_disp(_P(root), "api")))
 
     # ---------------- 收尾 ----------------
     print("\n==== %d 项失败 ====" % len(FAILED))

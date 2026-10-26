@@ -311,6 +311,11 @@ python orch.py rollup --gate --cost        # 收工后三层汇总：断言 / �
 **一份简报都不生成**，并逐条点名缺的是哪一路的哪一项。大脑只能有一个，`--force` 单独
 换不掉它：换人要两步（先 `--no-lead`，再 `--lead`），每步都记进 `lead_history`。
 
+简报里三处的「主语」必须落在这一路身上：能碰的目录用**角色**的 `--dir`（是文件就写 `tg.py`，
+不是 `tg.py/`）、步骤级 `out` 另标一段并注明「别拿它当你的边界」、验收断言按「点名了谁的路径」
+分给各路（`cmd:python tests/x.py` 归 `tester`，认不出的算整步）。一条自己的断言都没有那一路，
+简报直说「停下来汇报」——让它自己编一条，等于教它越界。
+
 门控分三层，**生死只由第一层决定**：断言看 `exit code`（唯一能否决 `done` 的）、
 reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三层分列打印，不会写
 「AI 评价通过」这种合体句；`jev` 的 `pass` 在人工抽查验证之前**不得**当 `done` 依据
@@ -460,11 +465,11 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 python tests/test_tg.py        # 213 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限 / 依赖链深度与成环 / 花费上限到顶拒绝
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
-python tests/test_orch.py      # 104 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 开工七问硬拦 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态 / 逐条数人确认（含全绿后的说法）
+python tests/test_orch.py      # 123 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 开工七问硬拦 / 简报内容（含「谁的断言归谁」） / --json 纯度 / 三层分列 / verdict 不改状态 / 逐条数人确认（含全绿后的说法）
 python tests/smoke_serve.py    # 55 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列、/api/reviews 的人确认进度（无逐条数据 ≠ 0 条、坏文件不许静默跳过）
 ```
 
-合计 **512 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **531 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
