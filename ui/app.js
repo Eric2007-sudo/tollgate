@@ -278,6 +278,121 @@ function renderSteps(s) {
   t.appendChild(tb);
 }
 
+/* ---------------------------------------------------------------- 人确认进度
+   数据来自 /api/reviews（契约 contract/reviews-api.md）。
+   verdict 只是概率建议，人确认进度是另一层：两层分句说，绝不合成一句。 */
+
+/* 纯函数：给定一份 review 的 human_claims，返回该显示的句子（0~2 句） */
+function humanClaimSentences(confirmed, total) {
+  if (total == null) return ["没有逐条数据"];
+  var c = confirmed || 0;
+  if (total > 0 && c >= total) {
+    return ["全部经人确认（" + c + "/" + total + " 条 claim）"];
+  }
+  if (c > 0) return ["人确认 " + c + "/" + total + " 条 claim", "部分确认不算验证通过"];
+  return ["一条都没人确认（0/" + total + "）"];
+}
+
+/* 纯函数：一份 review → 一句话（第二句用「。」隔开） */
+function renderHumanClaims(rv) {
+  var hc = (rv && rv.human_claims) || {};
+  return humanClaimSentences(hc.confirmed, hc.total).join("。");
+}
+
+/* pass_prob 为 null 就是没给概率，不许拿 confidence 顶替 */
+function probText(p) {
+  return p == null ? "无概率" : pct(p);
+}
+
+function claimCell(confirmed, total) {
+  var td = el("td", "claims");
+  humanClaimSentences(confirmed, total).forEach(function (s, i) {
+    td.appendChild(el("div", i === 0 ? "c1" : "c2", s));
+  });
+  return td;
+}
+
+function renderReviews(data) {
+  var box = $("#reviews");
+  if (!box) return;
+  box.textContent = "";
+
+  if (!data || data.ok !== true) {
+    box.appendChild(el("div", "muted", "拿不到 /api/reviews：" +
+      ((data && data.error) || "接口没回东西")));
+    return;
+  }
+
+  /* note 原样显示，别删别改 */
+  box.appendChild(el("div", "revnote", data.note || ""));
+
+  var sum = data.summary || {};
+  var head = el("div", "revsum");
+  head.appendChild(el("span", null,
+    humanClaimSentences(sum.claims_confirmed, sum.claims_total).join("。")));
+  head.appendChild(el("span", "muted", " · " + (sum.steps || 0) + " 份 review" +
+    (sum.without_claims ? "，其中 " + sum.without_claims + " 份没有逐条数据" : "")));
+  box.appendChild(head);
+
+  var bad = data.bad_files || [];
+  if (bad.length) {
+    var ul = el("ul", "badfiles");
+    bad.forEach(function (b) {
+      ul.appendChild(el("li", null, (b.file || "?") + "：" + (b.error || "解析不了")));
+    });
+    box.appendChild(ul);
+  }
+
+  var rows = data.reviews || [];
+  if (!rows.length) {
+    box.appendChild(el("div", "muted", "还没有任何 .plan/review-<步>.json。"));
+    return;
+  }
+
+  var wrap = el("div", "tablewrap");
+  var t = el("table", "reviews");
+  var hr = el("tr");
+  [["步", "num"], ["reviewer", ""], ["verdict（概率结论，不是验收结论）", ""],
+   ["概率", "num"], ["人确认进度", ""]].forEach(function (c) {
+    hr.appendChild(el("th", c[1] || null, c[0]));
+  });
+  var thead = el("thead");
+  thead.appendChild(hr);
+  t.appendChild(thead);
+
+  var tb = el("tbody");
+  rows.forEach(function (rv) {
+    var tr = el("tr");
+    tr.appendChild(el("td", "num", String(rv.step == null ? "?" : rv.step)));
+    tr.appendChild(el("td", null, rv.reviewer || "-"));
+
+    var vd = el("td");
+    var v = rv.verdict || "?";
+    vd.appendChild(el("span", "badge " + v, v));
+    tr.appendChild(vd);
+
+    var pd = el("td", "num", probText(rv.pass_prob));
+    if (rv.pass_prob == null) pd.className = "num muted";
+    tr.appendChild(pd);
+
+    var hc = rv.human_claims || {};
+    tr.appendChild(claimCell(hc.confirmed, hc.total));
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  wrap.appendChild(t);
+  box.appendChild(wrap);
+}
+
+async function pullReviews() {
+  try {
+    var r = await fetch("/api/reviews", { cache: "no-store" });
+    renderReviews(await r.json());
+  } catch (e) {
+    renderReviews({ error: "连不上后端：" + e });
+  }
+}
+
 function render(s) {
   if (s.error) {
     $("#status").textContent = "错误：" + s.error;
@@ -313,4 +428,6 @@ $("#sample").addEventListener("click", async function () {
 });
 
 pull();
+pullReviews();
 setInterval(pull, POLL_MS);
+setInterval(pullReviews, POLL_MS);

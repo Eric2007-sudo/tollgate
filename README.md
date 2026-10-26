@@ -337,9 +337,15 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 「账本花费」是**上次 `sync` 那一刻**的快照，宿主累计（`ctx.cumulative`）一直在涨——两者差多少
 ≈ 上次对账之后又跑掉的钱。看板把「截至上次 sync」写在卡片上，不假装自己实时。
 
-它是一个静态页 + 一个 JSON 接口，没有构建步骤，没有前端依赖。
+它还有一块「人确认进度」面板（`GET /api/reviews`）：每个 `review-<步>.json` 的
+`human_verified`、`N/M 条 claim 经人确认`、`bad_files`。这里说的和 `verdict` 是两层，
+面板上分句说：`全部经人确认（N/N 条 claim）` 或 `人确认 N/M 条 claim` + `部分确认不算验证通过`。
+**「没有逐条数据」（`total` 为 `null`）不许显示成 `0/0`**，解析不了的 review 文件红字列出来
+而不是静默跳过。字段级口径见 `contract/reviews-api.md`。
 
-要写脚本读 `/api/state`，用 `http.client` 直连。用 `urllib` 时如果本机设了 `HTTP_PROXY`，
+它是一个静态页 + 两个只读 JSON 接口，没有构建步骤，没有前端依赖。
+
+要写脚本读 `/api/state` 或 `/api/reviews`，用 `http.client` 直连。用 `urllib` 时如果本机设了 `HTTP_PROXY`，
 请求会被代理吞掉（返回 502 而不是看板的 200）——这不是服务的问题，域名白名单加上 `127.0.0.1` 就行。
 
 ---
@@ -455,10 +461,10 @@ python tests/test_tg.py        # 213 项：计划 / 门禁 / 预算口径 / 兼�
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
 python tests/test_orch.py      # 104 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 开工七问硬拦 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态 / 逐条数人确认（含全绿后的说法）
-python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
+python tests/smoke_serve.py    # 55 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列、/api/reviews 的人确认进度（无逐条数据 ≠ 0 条、坏文件不许静默跳过）
 ```
 
-合计 **492 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **512 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 

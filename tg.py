@@ -2980,6 +2980,71 @@ def ui_dir():
     return Path(__file__).resolve().parent / "ui"
 
 
+def reviews_payload(root):
+    """每个 review-<步>.json 的人确认进度 —— 只读、不裁决。
+
+    为什么内核要读这个：人确认进度现在只有终端里的 `orch rollup` 看得到，
+    看板上看不见，等于「验到哪了」只存在于一个人滚过的屏幕里。
+    """
+    d = root / ".plan"
+    rows, bad = [], []
+    for f in sorted(d.glob("review-*.json")):
+        m = re.fullmatch(r"review-(\d+)\.json", f.name)
+        if not m:
+            continue
+        try:
+            doc = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as e:
+            bad.append({"file": f.name, "error": "解析不了：%s" % e})
+            continue
+        if not isinstance(doc, dict):
+            bad.append({"file": f.name, "error": "顶层不是一个对象"})
+            continue
+        missing = [k for k in ("step", "reviewer", "verdict") if k not in doc]
+        if missing:
+            bad.append({"file": f.name, "error": "缺字段：%s" % "、".join(missing)})
+            continue
+        # 「jev 自己的汇总」那一行不是 claim，别算进分母
+        checks = [c for c in (doc.get("checks") or [])
+                  if "jev 自己的汇总" not in (c.get("name") or "")]
+        hc = doc.get("human_confirmed_claims") or {}
+        if isinstance(hc, dict) and hc.get("total"):
+            conf, total = int(hc.get("confirmed") or 0), int(hc["total"])
+        elif checks:
+            conf = sum(1 for c in checks if c.get("human_confirmed") is True)
+            total = len(checks)
+        else:
+            # 没有任何逐条数据 ≠ 0 条都没确认，报 null 让前端去说「没有」
+            conf, total = 0, None
+        rows.append({
+            "file": f.name, "step": doc.get("step"), "reviewer": doc.get("reviewer"),
+            "verdict": doc.get("verdict"),
+            "pass_prob": (doc.get("probs") or {}).get("pass"),
+            "reviewed_at": doc.get("reviewed_at"),
+            "human_verified": doc.get("human_verified") is True,
+            "human_claims": {"confirmed": conf, "total": total},
+        })
+    tot_c = sum(r["human_claims"]["confirmed"] for r in rows)
+    tot_t = sum(r["human_claims"]["total"] or 0 for r in rows)
+    return {
+        "api": JSON_API,
+        "cmd": "reviews",
+        "ok": True,
+        "reviews": rows,
+        "bad_files": bad,
+        "summary": {
+            "steps": len(rows),
+            "bad": len(bad),
+            "claims_confirmed": tot_c,
+            "claims_total": tot_t or None,
+            "all_confirmed": bool(tot_t) and tot_c == tot_t,
+            "without_claims": sum(1 for r in rows if not r["human_claims"]["total"]),
+        },
+        # 这句话要跟着数据一起出去：看板上少一句，就会有人拿 verdict 当验收结论。
+        "note": "人确认进度只读；verdict 只是概率建议，done 只认断言 exit code。",
+    }
+
+
 def state_payload(root):
     plan = plan_maybe(root)
     ledger = load_ledger(root)
@@ -3101,6 +3166,12 @@ def _make_handler(root):
             if path == "/api/state":
                 try:
                     self._json(state_payload(root))
+                except Exception as e:
+                    self._json({"error": str(e)}, 500)
+                return
+            if path == "/api/reviews":
+                try:
+                    self._json(reviews_payload(root))
                 except Exception as e:
                     self._json({"error": str(e)}, 500)
                 return
