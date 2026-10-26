@@ -29,7 +29,8 @@
    迟早有人拿语义 verdict 当验收依据。
 2. **jev 的 `pass` 在人工抽查验证之前不得当作 `done` 依据。** 双轨期要求：每条
    jev 评价旁边记一句 `human_verified`，`orch rollup` 会把「评了几次 / 抽查了几次」
-   摆出来，没抽查满就一直警告。
+   摆出来，没抽查满就一直警告。**抽查满了也不改这条铁律** —— 它只说明「这一层接对了、
+   它说的话有人核过」，不说明「以后可以信它」。
 3. **没查就说没查。** `rollup` 不给 `--gate` 时不做打架检测（因为 `status=done`
    只说明「当时过了」，代码可能已经变了），并且明说「没查不等于没打架」——
    绝不输出一个看着像结论的「0 个打架」。
@@ -78,7 +79,8 @@
 | `evidence` | 否 | 它到底看了什么。**只写了 diff 没跑起来** 这件事必须写在这儿 |
 | `human_verified` | 否 | 人抽查过才写 `true`，且只有在**全部** claim 都被人确认过时才为 `true`。缺省视为 `false` |
 | `checks[].human_confirmed` | 否 | 逐条：这条 claim 人到底看过没有（`true` / `false`），配合 `checks[].human_basis` 写清依据 |
-| `human_confirmed_claims` | 否 | `{"confirmed": 1, "total": 4}`。**部分确认不算验证通过**，但「确认了 1 条」和「一条没确认」必须能分开看 —— `orch rollup` 逐条数 |
+| `human_confirmed_claims` | 否 | `{"confirmed": 1, "total": 4}`。**部分确认不算验证通过**，但「确认了 1 条」和「一条没确认」必须能分开看 —— `orch rollup` 逐条数。全绿（`confirmed == total`）时 `rollup` 换成另一句话说明「全部经人确认」，不再照抄「仍是 false」 |
+| `checks[].human_basis` | 否 | 这条依据写清**答复粒度**：是逐条单独答复，还是一次整批答复。人都答了「对」，这两种不是同一件事，不许合并表述 |
 | `reviewer_session` | 否 | 评价这件事本身花了哪个会话的钱，能追到账 |
 | `cost_usd` | 否 | 评价本身的成本。一次评价也是有代价的，别算进「免费的检查」 |
 

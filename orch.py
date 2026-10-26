@@ -792,8 +792,14 @@ def cmd_rollup(a):
         out("  jev 双轨期：%d 次评价里有 %d 次全部 claim 经人抽查。"
             % (len(jev_rows), len(jev_spot)))
         if claim_tot:
-            out("  逐条看：人确认了 %d/%d 条 claim —— 部分确认**不算**验证通过，"
-                "顶层 human_verified 仍是 false。" % (claim_conf, claim_tot))
+            if claim_conf < claim_tot:
+                out("  逐条看：人确认了 %d/%d 条 claim —— 部分确认**不算**验证通过，"
+                    "顶层 human_verified 仍是 false。" % (claim_conf, claim_tot))
+            else:
+                # 反过来那一半也要说：全绿了就不许再照抄上面那句，
+                # 否则人做的确认被一句话抹掉，读出来的还是「没人验过」。
+                out("  逐条看：%d/%d 条 claim 全部经人确认（每一步的顶层 human_verified 都是 true）。"
+                    % (claim_conf, claim_tot))
         if len(jev_spot) < len(jev_rows):
             out("  抽查没做全之前，jev 的 verdict **不许**当 done 的依据 ——")
             out("  它只是「另一种看法」，而 done 只认断言 exit code。")

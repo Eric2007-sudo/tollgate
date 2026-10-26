@@ -391,6 +391,21 @@ def main():
     check("rollup --json 带 note：verdict 只是概率建议",
           "exit code" in d.get("note", ""))
 
+    # 反过来的那一半：claim 全绿了，就不许再照抄「顶层 human_verified 仍是 false」。
+    # 那句话只在真有人没确认时才成立；不分情况地印，等于把人做的确认一句话抹掉。
+    review(root, 2, verdict="fail", probs={"pass": 0.2, "fail": 0.8},
+           checks=[{"name": "claim1", "ok": True, "human_confirmed": True},
+                   {"name": "claim2", "ok": True, "human_confirmed": True},
+                   {"name": "claim3", "ok": True, "human_confirmed": True},
+                   {"name": "（jev 自己的汇总）", "ok": True}],
+           human_verified=True,
+           human_confirmed_claims={"confirmed": 3, "total": 3})
+    r = oc(["rollup"], root)
+    check("claim 全绿时改口说「全部经人确认」",
+          "全部经人确认" in r.stdout, r.stdout[-900:])
+    check("claim 全绿时不再印「仍是 false」（不许不分情况照抄）",
+          "仍是 false" not in r.stdout, r.stdout[-900:])
+
     # ---------------- 契约版本：tg 换了 api 就得停 ----------------
     fake = os.path.join(root, "fake_tg.py")
     with open(fake, "w", encoding="utf-8") as fh:
