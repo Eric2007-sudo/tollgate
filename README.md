@@ -32,7 +32,8 @@
   有一条破就是非 `0`，模型自己说「做好了」不能顶替它。
 - **两道闸**：闸一管这轮该不该发（计划预算、依赖、并发路数、花费上限），闸二管这轮塞多少
   （上下文多大、多少钱、还撑几轮、该不该换干净会话）。
-- **一个编排层** `orch.py`：多角色并发之前先踩四道刹车——路数、目录重叠、依赖链深度、契约在不在。
+- **一个编排层** `orch.py`：多角色并发之前先踩四道刹车——路数、目录重叠、依赖链深度、契约在不在，
+  再过一遍**开工七问**（谁是大脑、每路做什么、谁合……缺一项就拒派发）。
   它只经 `subprocess` 调 `tg --json`，不 import 内部、不派发进程。
 - **一个只读工作台**：标准库 `http.server`，只绑 `127.0.0.1`，校验 Host 头。
 
@@ -292,8 +293,9 @@ $ tg gate 1 --timeout 1
 **不调模型、不起进程、不改计划**，只经 `subprocess` 吃 `tg` 的 `--json` 契约。
 
 ```bash
-python orch.py role add backend  --dir api/ --reviewer jev    # 角色 = 一个它独占的目录
-python orch.py role add frontend --dir web/ --reviewer jev
+python orch.py role add backend  --dir api/ --task "产出 api 的字段与路由" --lead --merge "谁看、谁合、合不上怎么办"
+python orch.py role add frontend --dir web/ --task "出界面，只调已定字段"   # 角色 = 一个它独占的目录
+python orch.py role list                   # 顺带把「开工七问答到哪了」摊开
 python orch.py fan 2                       # 派发前踩刹车，过了就一人一份自足式简报
 python orch.py rollup --gate --cost        # 收工后三层汇总：断言 / 语义 / 人
 ```
@@ -301,6 +303,13 @@ python orch.py rollup --gate --cost        # 收工后三层汇总：断言 / �
 派发前踩的四道刹车：**并发路数**（默认 2）、**目录重叠**、**依赖链深度**（默认 3）、
 **契约文件在不在**。路数上限不是性能旋钮：Anthropic 的多 agent 系统是 15× token 换
 +90.2% 且明说编码任务并行度低，MAST 查 1642 条轨迹里头号失败模式就是 cost runaway。
+
+刹车管「会不会炸」，**开工七问**管「炸之前有没有人拍板」：①并发几路 ②哪个是大脑
+③几个角色、各碰哪个目录 ④每路具体做什么 ⑤谁合、合不上怎么办（这五问由人答）
+⑥怎么观察进度 ⑦怎么算跑通（这两问由工具给固定命令：`tg status` / `orch rollup` /
+`tg serve`；`tg gate <n>` 的 exit code 为 0）。②④⑤ 缺一项，`orch fan` 就 exit 2、
+**一份简报都不生成**，并逐条点名缺的是哪一路的哪一项。大脑只能有一个，`--force` 单独
+换不掉它：换人要两步（先 `--no-lead`，再 `--lead`），每步都记进 `lead_history`。
 
 门控分三层，**生死只由第一层决定**：断言看 `exit code`（唯一能否决 `done` 的）、
 reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三层分列打印，不会写
@@ -415,7 +424,8 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
     数据会离开本机；本区域直连还被 451 挡住，必须走代理——所以**代理一挂，这一层就整个不工作**
     （实测过：代理端口还在、CONNECT 也回 200，上游却是死的）。已验收程度与踩过的六个坑写在
     `docs/jev-onboarding.md`：合成 6/6、真步骤 3 次（`unsure 0.81` / `unsure 0.70` / `pass 0.99`）、
-    机器抽查 13/13，**人工抽查 0/13 还没做**——所以它现在仍然只是「另一种看法」。
+    机器抽查 13/13，**人工抽查 2/13 条 claim**（第 7 步第 4 条「多路 doing 时 `resume` 不替你挑」、
+    第 8 步第 3 条「成环说清楚了」已由人确认；其余 11 条人还没看）——没看完之前它仍然只是「另一种看法」。
     另一个容易踩的：它给概率的敏感度很高，同一份代码换个证据就能从「不支持」变「verified」，
     所以 `reviewer` 不该被当成测量仪。想零外传就用 `reviewer=none`。
 
@@ -426,14 +436,14 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 | 文件 | 讲什么 |
 |---|---|
 | `references/gates.md` | 两道闸的守卫点、断言语法、门禁为什么拒 |
-| `references/orchestration.md` | 编排层：角色/目录边界、四道刹车、`review-*.json` 字段格式、三层门控的不变量 |
+| `references/orchestration.md` | 编排层：角色/目录边界、四道刹车 + 开工七问、`review-*.json` 字段格式、三层门控的不变量 |
 | `references/plan-format.md` | 计划 / 账本 / 游标的字段级格式；删 `.plan/` 里哪个文件会出什么事 |
 | `references/context-budget.md` | 计费公式、缓存命中、1.5× 换手结论、预算口径 vs 钱 |
 | `references/tiers.md` | 三档判据、模型 ID 映射、用账本里的真实单轮价验证档位是否生效 |
 | `references/handoff.md` | 简报怎么写、三种交付方式、换手与「回来」各自的钱 |
 | `references/anti-patterns.md` | 29 条真实失败模式（#20–#28 是闸二的口径坑与账本边界，#29 是门禁把自己跑不完） |
 | `docs/dogfood.md` | 一次真实任务的战报：拿狗粮跑闭环撞出来的七个缺口，含真实账本数字 |
-| `docs/jev-onboarding.md` | 语义层第一次接入的验收台账：合成 6/6、真步骤 3 次、机器抽查 13/13、**人工抽查 0/13**，以及接通过程里踩的六个坑（key 被自己的正则截断、区域 451、`mcp` 多了一层 `servers`） |
+| `docs/jev-onboarding.md` | 语义层第一次接入的验收台账：合成 6/6、真步骤 3 次、机器抽查 13/13、**人工抽查 2/13 条 claim**（7.4、8.3 已确认，其余 11 条未看），以及接通过程里踩的六个坑（key 被自己的正则截断、区域 451、`mcp` 形状那条后来被自己的实测推翻了一半） |
 
 ---
 
@@ -443,16 +453,16 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 python tests/test_tg.py        # 213 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限 / 依赖链深度与成环 / 花费上限到顶拒绝
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
-python tests/test_orch.py      # 66 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态
+python tests/test_orch.py      # 101 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 开工七问硬拦 / 简报内容 / --json 纯度 / 三层分列 / verdict 不改状态 / 逐条数人确认
 python tests/smoke_serve.py    # 35 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列
 ```
 
-合计 **454 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **489 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 
 ```bash
-python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 454）
+python tests/check_doc_counts.py   # 真跑上面五个套件，核对 README 写的项目数与合计（不计入 489）
 ```
 
 ---

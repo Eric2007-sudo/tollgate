@@ -76,7 +76,9 @@
 | `confidence` | 否 | 0–1。和 `probs.pass` 不是一回事：一个说「我多确定」，一个说「我觉得多可能」 |
 | `checks` | 否 | 逐项检查，比一个大 verdict 有用得多 |
 | `evidence` | 否 | 它到底看了什么。**只写了 diff 没跑起来** 这件事必须写在这儿 |
-| `human_verified` | 否 | 人抽查过才写 `true`。缺省视为 `false` |
+| `human_verified` | 否 | 人抽查过才写 `true`，且只有在**全部** claim 都被人确认过时才为 `true`。缺省视为 `false` |
+| `checks[].human_confirmed` | 否 | 逐条：这条 claim 人到底看过没有（`true` / `false`），配合 `checks[].human_basis` 写清依据 |
+| `human_confirmed_claims` | 否 | `{"confirmed": 1, "total": 4}`。**部分确认不算验证通过**，但「确认了 1 条」和「一条没确认」必须能分开看 —— `orch rollup` 逐条数 |
 | `reviewer_session` | 否 | 评价这件事本身花了哪个会话的钱，能追到账 |
 | `cost_usd` | 否 | 评价本身的成本。一次评价也是有代价的，别算进「免费的检查」 |
 
@@ -87,14 +89,20 @@
 
 ```bash
 # 角色 = 一个它独占的目录。目录一重叠就不是并发，是抢文件。
-orch role add backend  --dir api/ --reviewer jev
-orch role add frontend --dir web/ --reviewer jev
-orch role list
+# --task 是「这一路具体做什么」，--lead 标大脑（全计划只能一个），--merge 是「谁看、谁合、合不上怎么办」。
+orch role add backend  --dir api/ --task "产出 api 的字段与路由，给前端当唯一事实来源" \
+                       --lead --merge "backend 先看接口对不对再合；对不上就改契约文件" --reviewer none
+orch role add frontend --dir web/ --task "出界面，只调 api/ 里已定的字段" --reviewer none
+orch role list                     # 顺带把「开工七问答到哪了」摊开，缺的写「会拒」
 
-# 派发前踩四道刹车，过了就一人一份自足式简报（不派发、不调模型）
+# 派发前踩四道刹车 + 过开工七问，过了就一人一份自足式简报（不派发、不调模型）
 orch fan 2                          # 默认全部已登记角色
 orch fan 2 --roles backend,frontend --json
 orch fan 2 --contract contract/CONTRACT.md
+
+# 换大脑必须两步走（--force 单独一个旗子换不掉，防止「为了推进先换掉拍板的」）
+orch role add backend  --dir api/ --force --no-lead --note "为什么换"
+orch role add frontend --dir web/ --lead --task "..." --force
 
 # 收工后三层汇总
 orch rollup            # 只读计划状态，不做打架检测（并明说没查）
@@ -116,6 +124,32 @@ orch rollup --gate --cost --json
 | 契约文件 | 必查 | 没契约只是警告（并说明「各自脑补 = 集成时返工」），显式指定了却不存在是硬拒 |
 
 路数上限不是性能旋钮，是刹车。依据写在下面「凭什么这么设」里。
+
+## 开工七问：并发之前先把这七件事答掉
+
+四道刹车管的是「会不会炸」，七问管的是「炸之前有没有人拍板」。前五问必须由人给答案，
+后两问由工具给（命令是固定的，不用人自己发明一套「怎么看进度」）：
+
+| # | 问 | 谁答 | 没有它 / 没有答案会怎样 |
+|---|---|---|---|
+| ① | 并发几路 | 人 | `--max-fanout`（默认 2）直接拒，并追问「这几路谁看、谁合、合不上怎么办」 |
+| ② | 哪个是大脑 | 人 | `role add --lead`。两个 lead = 零个 lead：互相等指令，token 照烧、进度不动 |
+| ③ | 几个角色、各碰哪个目录 | 人 | `role add --dir`。目录重叠 = 抢同一批文件，不是并发 |
+| ④ | 每路具体做什么 | 人 | `role add --task`。**只有目录不算任务**：指令缺一句，执行的人就会自己发明一句 |
+| ⑤ | 谁合、合不上怎么办 | 人 | `role add --merge`。并发最贵的一课是「各自都对，合不上」 |
+| ⑥ | 怎么观察进度 | 工具 | `tg status`（谁在 doing）· `orch rollup`（三层分列）· `tg serve`（只读看板，只绑 127.0.0.1） |
+| ⑦ | 怎么算跑通 | 工具 | `tg gate <n>` 的 **exit code 为 0**。概率、账本、看板颜色都不算 |
+
+②④⑤ 缺任何一项，`orch fan` 直接拒绝派发（exit 2，**一份简报都不生成**），并把缺口逐条点名：
+「`frontend` 具体做什么 —— 没写 `--task`」。`role list` 也会把七问的现状摊开，缺的写「会拒」。
+
+**换大脑不许用一个旗子搞定。** `--force` 单独不解锁换人：要两步，
+① `role add <现任> --force --no-lead`（带 `--note` 说清为什么），② `role add <新大脑> --lead ...`。
+每一步都记进 `.orch/roles.json` 的 `lead_history`（时间、角色、从谁换成谁、原因）。
+理由很实际：只给一个旗子，就等于给「为了让流程往下走，先把拍板的换掉」留了后门。
+
+`fan --json` 里对应 `preflight` 字段（`lead` / `routes[]`（含每路的 `task`）/ `merge` / `observe[]` /
+`done_when[]`），下游不用再解析人类文字。
 
 ## 并发怎么真落地
 

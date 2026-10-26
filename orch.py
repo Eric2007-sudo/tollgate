@@ -173,11 +173,15 @@ def load_roles(root):
     p = orch_dir(root) / "roles.json"
     if not p.is_file():
         return {"schema": ORCH_SCHEMA, "max_fanout": DEFAULT_MAX_FANOUT,
-                "max_depth": DEFAULT_MAX_DEPTH, "roles": {}}
+                "max_depth": DEFAULT_MAX_DEPTH, "lead": "", "merge": "", "roles": {}}
     st = read_json(p)
     st.setdefault("schema", ORCH_SCHEMA)
     st.setdefault("max_fanout", DEFAULT_MAX_FANOUT)
     st.setdefault("max_depth", DEFAULT_MAX_DEPTH)
+    # 「哪一个是大脑」和「谁合、合不上怎么办」是计划级的答案，不是角色的属性：
+    # 大脑只能有一个，合并方案也只有一套。放在 roles.json 顶层，缺了就拒派发。
+    st.setdefault("lead", "")
+    st.setdefault("merge", "")
     st.setdefault("roles", {})
     return st
 
@@ -219,14 +223,39 @@ def cmd_role_add(a):
     name = a.name
     if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name):
         die("角色名只许小写字母/数字/._-（别用中文和空格，它要进文件名）：%r" % name)
-    if name in st["roles"] and not a.force:
-        die("角色 %r 已登记。要改就加 --force" % name)
     if a.reviewer not in REVIEWERS:
-        die("--reviewer 只能是 %s 之一（jev 默认离线零外传；startlux 需要 key；"
+        die("--reviewer 只能是 %s 之一（jev 是云上服务、代码会外传；startlux 需要 key；"
             "local-4b 是离线兜底；none = 只跑断言）" % " / ".join(REVIEWERS))
     d = str(a.dir or "").replace("\\", "/").strip().strip("/")
     if not d:
         die("--dir 不许为空。角色边界必须是目录边界，没有目录就不算角色。")
+    task = (getattr(a, "task", None) or "").strip()
+    merge = (getattr(a, "merge", None) or "").strip()
+    drop_lead = bool(getattr(a, "no_lead", False))
+    cur_lead = (st.get("lead") or "").strip()
+    if drop_lead:
+        # 撤大脑得两步走，并且必须说清是谁撤的：单独一个 --force 就能换人，
+        # 等于给「为了让流程往下走，先把拍板的换掉」留了后门。
+        if not a.force:
+            die("撤销大脑要明说：orch role add %s --dir %s --force --no-lead\n"
+                "    少了 --force 就等于「手滑就把拍板的撤了」。" % (name, d))
+        if cur_lead != name:
+            die("只有现任大脑能被撤：现在是 %r，不是 %r。\n"
+                "    要换人请两步走：① orch role add %r --dir <目录> --force --no-lead\n"
+                "                    ② orch role add <新大脑> --dir <目录> --lead --task \"...\""
+                % (cur_lead or "（没有）", name, cur_lead or "（没有）"))
+    if a.lead and not drop_lead:
+        if cur_lead and cur_lead != name:
+            die("大脑只能有一个：现在登记的是 %r，而且 --force 也换不掉它。\n"
+                "    加一个旗子就能换人，等于给「为了让流程往下走先换掉拍板的」留后门。\n"
+                "    真要换，两步走（每步都留痕）：\n"
+                "      ① orch role add %s --dir %s --force --no-lead\n"
+                "      ② orch role add %s --dir %s --lead --task \"...\"\n"
+                "    多智能体最贵的失败不是算力不够，是没人拍板 —— 两个 lead 等于零个 lead。"
+                % (cur_lead, cur_lead,
+                   (st["roles"].get(cur_lead) or {}).get("dir", "<目录>"), name, d))
+    if name in st["roles"] and not a.force:
+        die("角色 %r 已登记。要改就加 --force" % name)
     for other, info in st["roles"].items():
         if other == name:
             continue
@@ -235,11 +264,41 @@ def cmd_role_add(a):
                 "    并发的安全边界是目录边界：一重叠就是两个 agent 抢同一批文件，\n"
                 "    冲突不是「可能出现」，是「什么时候出现」。先拆目录。"
                 % (name, d, other, info.get("dir")))
-    st["roles"][name] = {"dir": d, "reviewer": a.reviewer, "note": a.note or ""}
+    st["roles"][name] = {"dir": d, "reviewer": a.reviewer, "note": a.note or "",
+                         "task": task or (st["roles"].get(name) or {}).get("task", "")}
+    if a.lead or drop_lead:
+        st.setdefault("lead_history", []).append({
+            "ts": now_iso(), "role": name,
+            "action": "drop-lead" if drop_lead else "set-lead",
+            "from": cur_lead or None,
+            "note": a.note or "",
+        })
+    if drop_lead:
+        st["lead"] = ""
+    elif a.lead:
+        st["lead"] = name
+    if merge:
+        st["merge"] = merge
     save_roles(root, st)
-    out("已登记角色 %s → %s/（reviewer=%s）" % (name, d, a.reviewer))
+    out("已登记角色 %s → %s/（reviewer=%s%s）"
+        % (name, d, a.reviewer,
+           "，lead=大脑" if (a.lead and not drop_lead) else ("，已撤销大脑" if drop_lead else "")))
     if a.reviewer == "startlux":
         out("  注意：startlux 的 key 还没接上时它只是个空位，别当它能评。")
+    # 登记不是目的，开工前那七问答得上来才是。缺什么就当场说出来，
+    # 别等到 fan 才拒 —— 那时候人已经在准备开 agent 了。
+    rest = []
+    if not st["roles"][name]["task"]:
+        rest.append("这一路具体做什么：--task \"产出什么、给谁用\"")
+    if not st.get("lead"):
+        rest.append("哪个是大脑：orch role add <名字> --lead --task \"...\"")
+    if not (st.get("merge") or "").strip():
+        rest.append("谁合、合不上怎么办：--merge \"谁看、谁合、合不上怎么办\"")
+    if rest:
+        out("")
+        out("开工七问还差 %d 项（fan 会因此拒绝派发）：" % len(rest))
+        for x in rest:
+            out("  · " + x)
 
 
 def cmd_role_list(a):
@@ -251,21 +310,37 @@ def cmd_role_list(a):
                         "schema": st["schema"],
                         "max_fanout": st["max_fanout"],
                         "max_depth": st["max_depth"],
+                        "lead": st.get("lead") or None,
+                        "merge": st.get("merge") or None,
                         "roles": [{"name": k, "dir": v.get("dir"),
                                    "reviewer": v.get("reviewer"),
+                                   "task": v.get("task", ""),
+                                   "is_lead": k == (st.get("lead") or ""),
                                    "note": v.get("note", "")}
                                   for k, v in roles.items()]},
                        ensure_ascii=False, indent=1))
         return
     if not roles:
-        out("还没有角色。加一个：orch role add backend --dir api/ --reviewer jev")
+        out("还没有角色。加一个：orch role add backend --dir api/ --reviewer none --task \"...\"")
         out("（并发的安全边界是目录边界：一个角色 = 一个它独占的目录）")
         return
     out("角色（%d 个，并发上限 %d 路）:" % (len(roles), st["max_fanout"]))
     for k, v in roles.items():
-        out("  %-12s → %-20s reviewer=%s%s"
+        out("  %-12s → %-20s reviewer=%s%s%s"
             % (k, v.get("dir", "-") + "/", v.get("reviewer", "-"),
+               "  ← 大脑" if k == (st.get("lead") or "") else "",
                ("   # " + v["note"]) if v.get("note") else ""))
+        out("  %-12s   %s" % ("", ("做什么：" + v["task"]) if v.get("task")
+                              else "做什么：（没写 —— fan 会拒派发）"))
+    out("")
+    out("开工七问：")
+    out("  ① 并发几路        ≤ %d 路（%d 个角色已登记）" % (st["max_fanout"], len(roles)))
+    out("  ② 哪个是大脑      %s" % (st.get("lead") or "（没定 → fan 会拒）"))
+    out("  ③ 几个角色/各碰哪 %s" % "、".join("%s→%s/" % (k, v.get("dir", "-"))
+                                          for k, v in roles.items()))
+    miss = [k for k, v in roles.items() if not (v.get("task") or "").strip()]
+    out("  ④ 每路做什么      %s" % ("都写了" if not miss else "缺：" + "、".join(miss)))
+    out("  ⑤ 谁合/合不上     %s" % (st.get("merge") or "（没写 → fan 会拒）"))
     dirs = [v.get("dir", "") for v in roles.values()]
     for i in range(len(dirs)):
         for j in range(i + 1, len(dirs)):
@@ -285,6 +360,13 @@ BRIEF_TMPL = """# 简报 · #{n} {title} · 角色 `{role}`
 
 **不许读、不许改**这些地方（它们是别的角色/别组的产物，读了就等于用别人的中间状态污染判断）：
 {forbidden}
+
+## 你这一路具体做什么
+
+{task}
+
+只做这一件事。发现还得做别的 → **停下来汇报**，不要顺手把别人的目录也改了：
+「各自都对、合不上」就是从这里开始的。
 
 ## 唯一的共同事实来源
 
@@ -385,7 +467,31 @@ def cmd_fan(a):
     elif not (root / contract).is_file():
         die("契约文件不存在：%s" % contract)
 
-    # ⑤ 现状提醒：doing 最多 DEFAULT_MAX_FANOUT 路，但每路必须是独立会话
+    # ⑤ 开工七问：前五问必须由人给答案，后两问由工具给（命令是固定的，不用人发明）。
+    #    缺一项就拒绝派发 —— 这不是「多问一句更稳」，是把「谁拍板、谁合」写死在文件里。
+    lead = (st.get("lead") or "").strip()
+    merge = (st.get("merge") or "").strip()
+    gaps = []
+    if not lead:
+        gaps.append("② 哪个是大脑 —— 没登记 lead。多智能体最贵的失败不是算力不够，是没人拍板；\n"
+                    "        两个 lead 等于零个 lead。\n"
+                    "        → orch role add <名字> --dir <目录> --lead --task \"...\"")
+    elif lead not in st["roles"]:
+        gaps.append("② 哪个是大脑 —— roles.json 里 lead=%r 已经不在角色表里了" % lead)
+    for role in roles:
+        if not (st["roles"][role].get("task") or "").strip():
+            gaps.append("④ %s 具体做什么 —— 没写 --task。只有目录不算任务：\n"
+                        "        指令缺一句，执行的人就会自己发明一句。\n"
+                        "        → orch role add %s --dir %s --task \"这一路产出什么、给谁用\""
+                        % (role, role, st["roles"][role]["dir"]))
+    if not merge:
+        gaps.append("⑤ 谁合、合不上怎么办 —— 没写合并方案。并发最贵的一课是「各自都对，合不上」。\n"
+                    "        → orch role add <lead> --lead --task \"...\" --merge \"谁看、谁合、合不上怎么办\"")
+    if gaps:
+        die("开工七问还差 %d 项，不派发（一份简报都没生成）：\n    %s"
+            % (len(gaps), "\n    ".join(gaps)))
+
+    # ⑥ 现状提醒：doing 最多 DEFAULT_MAX_FANOUT 路，但每路必须是独立会话
     others_doing = [n for n in status.get("doing", []) if n != a.step]
     if others_doing or len(roles) > 1:
         warn("并发的前提是**每路一个独立会话**。tg 允许最多 %d 步同时 doing"
@@ -419,6 +525,7 @@ def cmd_fan(a):
         body = BRIEF_TMPL.format(
             n=step["n"], title=step["title"], role=role,
             dir=st["roles"][role]["dir"],
+            task=st["roles"][role].get("task") or "（没写 —— 停下来要一句话再动手）",
             forbidden="\n".join(forbid),
             contract=("`%s`（先完整读一遍）" % contract) if contract
             else "**没有契约文件** —— 先停下来要一份，别自己发明字段名。",
@@ -439,15 +546,29 @@ def cmd_fan(a):
         "ts": now_iso(), "step": step["n"], "title": step["title"],
         "roles": roles, "briefs": briefs, "max_fanout": limit,
         "depth": depth, "contract": contract,
+        "lead": lead, "merge": merge,
     })
     save_state(root, state)
+
+    # 七问的答案要一起落进记录：只写「派了几路」，事后没人知道谁拍板、谁合并。
+    preflight = {
+        "fanout": {"count": len(roles), "limit": limit},
+        "lead": lead,
+        "routes": [{"role": r, "dir": st["roles"][r]["dir"] + "/",
+                    "task": st["roles"][r].get("task", "")} for r in roles],
+        "merge": merge,
+        # 后两问由工具答：命令是固定的，不需要人去发明一套「怎么看进度」
+        "observe": ["tg status", "orch rollup", "tg serve（只读看板，只绑 127.0.0.1）"],
+        "done_when": ["tg gate %d 的 exit code 为 0" % step["n"],
+                      "语义层的 verdict 与概率都不构成 done 依据"],
+    }
 
     if a.json:
         out(json.dumps({
             "api": ORCH_JSON_API, "cmd": "fan", "ok": True,
             "step": step["n"], "title": step["title"], "depth": depth,
             "max_fanout": limit, "roles": roles, "briefs": briefs,
-            "contract": contract,
+            "contract": contract, "preflight": preflight,
             "warnings": list(WARNINGS),
             "dispatch": [{"role": r, "dir": st["roles"][r]["dir"] + "/",
                           "brief": briefs[r],
@@ -458,6 +579,16 @@ def cmd_fan(a):
         }, ensure_ascii=False, indent=1))
         return
 
+    out("开工七问（②④⑤ 由你答，⑥⑦ 由工具答）：")
+    out("  ① 并发几路        %d 路（上限 %d 路）" % (len(roles), limit))
+    out("  ② 哪个是大脑      %s" % lead)
+    for r in roles:
+        out("  ③ %-12s 只碰 %-12s ④ %s"
+            % (r, st["roles"][r]["dir"] + "/", st["roles"][r].get("task", "")))
+    out("  ⑤ 谁合/合不上     %s" % merge)
+    out("  ⑥ 怎么观察进度    tg status（谁在 doing）· orch rollup（三层分列）· tg serve（只读看板）")
+    out("  ⑦ 怎么算跑通      tg gate %d 的 exit code 为 0 —— 概率和账本都不算" % step["n"])
+    out("")
     out("已生成 %d 份简报（#%d %s，依赖深度 %d，并发上限 %d 路）："
         % (len(briefs), step["n"], step["title"], depth, limit))
     for role in roles:
@@ -494,6 +625,23 @@ def read_review(root, n):
         return None, "review-%d.json 的 reviewer=%r 不在允许列表里（%s）" % (
             n, d.get("reviewer"), "/".join(REVIEWERS))
     return d, None
+
+
+def claim_stat(rv):
+    """人到底确认了哪几条 claim → (已确认, 总数)。没有逐条数据时总数为 None。
+
+    「整份 review 翻了 true」是粗粒度的：13 条 claim 里确认 1 条和确认 13 条，
+    顶层 human_verified 都是 false，但这两件事完全不是一回事 —— 所以逐条数出来。
+    """
+    hc = rv.get("human_confirmed_claims") or {}
+    if isinstance(hc, dict) and hc.get("total"):
+        return int(hc.get("confirmed") or 0), int(hc["total"])
+    checks = rv.get("checks") or []
+    claim_rows = [c for c in checks
+                  if "jev 自己的汇总" not in (c.get("name") or "")]
+    if not claim_rows:
+        return 0, None
+    return sum(1 for c in claim_rows if c.get("human_confirmed") is True), len(claim_rows)
 
 
 def cmd_rollup(a):
@@ -562,6 +710,13 @@ def cmd_rollup(a):
     human_ok = [r for r in reviewed if r["review"].get("human_verified") is True]
     jev_rows = [r for r in reviewed if r["review"].get("reviewer") == "jev"]
     jev_spot = [r for r in jev_rows if r["review"].get("human_verified") is True]
+    claim_conf = claim_tot = 0
+    for r in reviewed:
+        c, t = claim_stat(r["review"])
+        r["claim_conf"], r["claim_tot"] = c, t
+        if t:
+            claim_conf += c
+            claim_tot += t
 
     payload = {
         "api": ORCH_JSON_API, "cmd": "rollup", "ok": True,
@@ -570,6 +725,7 @@ def cmd_rollup(a):
         "conflicts": [{"n": n, "why": w} for n, w in conflicts],
         "conflict_check": ("rerun" if a.gate else "skipped_no_gate"),
         "reviewed": len(reviewed), "human_verified": len(human_ok),
+        "human_claims": {"confirmed": claim_conf, "total": claim_tot or None},
         "jev_dual_track": {"reviews": len(jev_rows), "spotchecked": len(jev_spot)},
         "bad_review_files": bad_files,
         "warnings": list(WARNINGS),
@@ -616,7 +772,9 @@ def cmd_rollup(a):
                str(rv.get("verdict", "-")),
                ("  概率 %s" % (("%.2f" % p) if isinstance(p, (int, float)) else p))
                if p is not None else "",
-               "" if rv.get("human_verified") is True else "  （未人工抽查）"))
+               "" if rv.get("human_verified") is True else
+               (("  （人确认 %d/%d 条 claim）" % (r.get("claim_conf", 0), r["claim_tot"]))
+                if r.get("claim_tot") else "  （未人工抽查）")))
 
     out("")
     out("== 第 3 层：人（只在两层打架时介入）==")
@@ -631,8 +789,11 @@ def cmd_rollup(a):
         out("  没有打架（断言与语义 verdict 一致或缺失）。")
     if jev_rows:
         out("")
-        out("  jev 双轨期：%d 次评价里有 %d 次做过人工抽查。"
+        out("  jev 双轨期：%d 次评价里有 %d 次全部 claim 经人抽查。"
             % (len(jev_rows), len(jev_spot)))
+        if claim_tot:
+            out("  逐条看：人确认了 %d/%d 条 claim —— 部分确认**不算**验证通过，"
+                "顶层 human_verified 仍是 false。" % (claim_conf, claim_tot))
         if len(jev_spot) < len(jev_rows):
             out("  抽查没做全之前，jev 的 verdict **不许**当 done 的依据 ——")
             out("  它只是「另一种看法」，而 done 只认断言 exit code。")
@@ -675,8 +836,15 @@ def main():
     p.add_argument("action", choices=["add", "list"])
     p.add_argument("name", nargs="?", help="add 时的角色名")
     p.add_argument("--dir", help="这个角色独占的产物目录")
+    p.add_argument("--task", help="这一路具体做什么（一句话：产出什么、给谁用）；fan 缺它就不派发")
+    p.add_argument("--lead", action="store_true",
+                   help="这个是大脑（唯一决策者）；全计划只能有一个，--force 也换不掉，要换走两步")
+    p.add_argument("--no-lead", dest="no_lead", action="store_true",
+                   help="撤销现任大脑（必须配 --force；换大脑的第一步）")
+    p.add_argument("--merge", help="谁看、谁合、合不上怎么办（计划级答案，写一次就够）")
     p.add_argument("--reviewer", default="jev",
-                   help="谁来评：%s（默认 jev，离线、零外传）" % "/".join(REVIEWERS))
+                   help="谁来评：%s（默认 jev —— 它是云上服务，代码会外传；"
+                        "要零外传用 none，本地小模型用 local-4b）" % "/".join(REVIEWERS))
     p.add_argument("--note", help="一句话说明")
     p.add_argument("--force", action="store_true", help="覆盖已登记的同名角色")
     p.add_argument("--json", action="store_true")
@@ -699,7 +867,7 @@ def main():
     a = ap.parse_args()
 
     if getattr(a, "version", False) or not a.cmd:
-        out("orch 0.1.0（tg --json api %d）  零依赖 · 不调模型 · 不管进程"
+        out("orch 0.2.0（tg --json api %d）  零依赖 · 不调模型 · 不管进程"
             % TG_JSON_API)
         if not a.cmd:
             ap.print_help()
