@@ -459,8 +459,11 @@ def main():
     bare = tempfile.mkdtemp(prefix="orch_bare_")
     oc(["role", "add", "x", "--dir", "a/"], bare, expect=2, must="没有 .plan/plan.json")
 
-    r = oc(["--version"], root, must="不调模型")
-    check("--version 把定位写清楚（不调模型、不管进程）", "不管进程" in r.stdout)
+    # 定位必须写实话：dispatch 真的会起会话，所以「不管进程」这句已经不能留。
+    # 留着它比不写更坏 —— 人会以为不加 dispatch 也会花钱，或者以为加了也不花钱。
+    r = oc(["--version"], root, must="零依赖")
+    check("--version 把定位写清楚（fan 不派发 / dispatch 才起会话）",
+          "dispatch 才起会话" in r.stdout and "不管进程" not in r.stdout)
 
     # 认「这条断言归谁」的规则本身也要钉住：归错了比不写更坏 ——
     # 一路把别人的测试当成自己的验收标准，只能越界去修，或者报「我这边过不了闸」。
@@ -486,6 +489,115 @@ def main():
           _orch.dir_disp(_P(root), "api") == "api/"
           and _orch.dir_disp(_P(root), "tg.py") == "tg.py",
           repr(_orch.dir_disp(_P(root), "api")))
+
+    # ---------------- dispatch：真派发层（这里只测「不花钱的那半」） ----------------
+    # 起真进程要花钱、要网络，测试里一律用 --dry-run 走完全部代码路径到 argv 为止。
+    # 真正会起进程的那几行，靠「只差一个 opencode_bin()」这个事实来保证：
+    # 检查项都写在 argv 上，而不是写在「起完之后发生了什么」。
+    droot = tempfile.mkdtemp(prefix="orch_disp_")
+    tg(["init", "派发测试", "--why", "派发层不起真会话也得能验"], droot)
+    tg(["add", "--title", "契约", "--out", "contract/C.md", "--rounds", "2",
+        "--reuse", "existing", "--accept", "file:exists:contract/C.md"], droot)
+    os.makedirs(os.path.join(droot, "contract"), exist_ok=True)
+    with open(os.path.join(droot, "contract", "C.md"), "w", encoding="utf-8") as fh:
+        fh.write("# 契约\n\n字段名以这里为准。\n")
+    tg(["start", "1"], droot)
+    tg(["done", "1"], droot)
+    tg(["add", "--title", "三路并行", "--out", "out/", "--rounds", "20",
+        "--depends", "1", "--reuse", "new",
+        "--accept", "file:exists:research/notes.md",
+        "--accept", "file:exists:web/index.html",
+        "--accept", "file:exists:api/app.py"], droot)
+    oc(["role", "add", "lead", "--dir", "plan/", "--lead", "--task", "拍板",
+        "--merge", "lead 看，合不上就拆步"], droot)
+    oc(["role", "add", "research", "--dir", "research/", "--task", "查资料出 notes.md"], droot)
+    oc(["role", "add", "fe", "--dir", "web/", "--task", "出 index.html"], droot)
+    oc(["role", "add", "be", "--dir", "api/", "--task", "出 app.py"], droot)
+
+    led = os.path.join(droot, ".plan", "ledger.jsonl")
+    before = len(read_text(led).splitlines()) if os.path.isfile(led) else 0
+
+    r = oc(["dispatch", "2", "--dry-run"], droot, expect=2)
+    check("dispatch 复用 fan 的刹车（4 路 > 2 路先被拒，不是先花钱）",
+          "上限是 2 路" in r.stderr, r.stderr[:200])
+
+    oc(["dispatch", "1", "--dry-run"], droot, expect=2, must="已经是 done")
+
+    r = oc(["dispatch", "2", "--dry-run", "--max-fanout", "4", "--concurrency", "2"],
+           droot, must="dry-run")
+    check("dry-run 里看得到真正会执行的命令（opencode run + 绝对目录）",
+          "opencode run" in r.stdout and "--auto" in r.stdout and "--format json" in r.stdout,
+          r.stdout[:400])
+    check("dry-run 明确说自己没起进程、没动账本",
+          "一个进程都没起" in r.stdout, r.stdout[-200:])
+
+    after = len(read_text(led).splitlines()) if os.path.isfile(led) else 0
+    check("dry-run 真的没往账本写东西", before == after, "%d -> %d" % (before, after))
+    check("dry-run 也不会替你建角色目录",
+          not os.path.isdir(os.path.join(droot, "web")),
+          "web/ 居然被建出来了")
+
+    r = oc(["dispatch", "2", "--dry-run", "--max-fanout", "4", "--concurrency", "2",
+            "--json"], droot)
+    d = json.loads(r.stdout)
+    check("dispatch --json 是纯 JSON（stdout 不掺人话）",
+          d.get("api") == 1 and d.get("cmd") == "dispatch" and d.get("dry_run") is True,
+          repr(d)[:200])
+    check("大脑单独一批，其余按并发数分批（4 路并发 2 = 三批）",
+          [b["roles"] for b in d["batches"]] == [["lead"], ["research", "fe"], ["be"]],
+          repr([b["roles"] for b in d["batches"]]))
+    check("「派几路」和「同时跑几路」是两个可分开的数",
+          d.get("max_fanout") == 4 and d.get("concurrency") == 2,
+          repr((d.get("max_fanout"), d.get("concurrency"))))
+    check("每一路都有 argv，且都点名了自己的目录",
+          len(d["planned"]) == 4 and
+          all(p["argv"][-1].replace("\\", "/").endswith(p["dir"].rstrip("/"))
+              for p in d["planned"]),
+          repr([p["argv"][-1] for p in d["planned"]]))
+
+    # 分批规则本身钉住：大脑先跑，其余切片；没有大脑就纯切片
+    check("plan_batches：大脑先单跑",
+          _orch.plan_batches(["lead", "a", "b", "c"], 2, "lead") ==
+          [["lead"], ["a", "b"], ["c"]],
+          repr(_orch.plan_batches(["lead", "a", "b", "c"], 2, "lead")))
+    check("plan_batches：没大脑时纯按上限切",
+          _orch.plan_batches(["a", "b", "c"], 2, "") == [["a", "b"], ["c"]],
+          repr(_orch.plan_batches(["a", "b", "c"], 2, "")))
+    check("plan_batches：大脑不在这一批里就不插队",
+          _orch.plan_batches(["a", "b"], 2, "lead") == [["a", "b"]],
+          repr(_orch.plan_batches(["a", "b"], 2, "lead")))
+
+    # 派发消息必须是**一行**：Windows 上 opencode 是 .CMD 包装，多行参数会被 cmd.exe
+    # 当成多条命令，`--format json` 随之失效 —— 实测过，整个流变成带 ANSI 的 TUI 渲染，
+    # 会话 id 挖不到，三路账全没归上。这条不许「优化」回内联正文。
+    m = _orch.dispatch_message(_P(droot), ".orch/briefs/2-fe.md", "fe")
+    check("派发消息是单行（多行会打掉 --format json，账就归不上）",
+          "\n" not in m and "\r" not in m, repr(m[:80]))
+    check("派发消息只点名自己那份简报，正文留在文件里",
+          m.count(".orch/briefs/2-fe.md") == 1 and "tg sync" in m, m[:200])
+
+    # `tg start` 不认 --json（argparse 会 exit 2）。派发器一开始就踩了这个坑：
+    # 闸说「不行」，其实是命令写错了 —— 这种误判比没有闸更危险，所以钉住。
+    bad, rc_bad = _orch.tg_json(["start", "2"], _P(droot))
+    check("`tg start --json` 会被 argparse 拒（所以不能拿它判「能不能开工」）",
+          rc_bad == 2 and bad is None, "rc=%r" % (rc_bad,))
+    good, rc_good = _orch.tg_json(["start", "2"], _P(droot), json_flag=False)
+    check("不带 --json 的 tg start 才是真开工（exit 0）",
+          rc_good == 0, "rc=%r" % (rc_good,))
+
+    # 会话 id 只从 NDJSON 里取；取不到就空着 ——「人看的日志里正好出现过 ses_」不算数。
+    good_log = _P(droot) / "run-ok.jsonl"
+    good_log.write_text('{"type":"text","sessionID":"ses_abc123","part":{}}\n',
+                        encoding="utf-8")
+    check("read_session 从 NDJSON 里取到会话 id",
+          _orch.read_session(good_log) == "ses_abc123", repr(_orch.read_session(good_log)))
+    tui_log = _P(droot) / "run-tui.jsonl"
+    tui_log.write_text("\x1b[0m> build 路 deepseek\n  会话 ses_zzz 已开始\n",
+                       encoding="utf-8")
+    check("read_session 在人看的 TUI 日志里不猜 id（返回空）",
+          _orch.read_session(tui_log) == "", repr(_orch.read_session(tui_log)))
+    check("read_session 读不到文件也不抛，返回空",
+          _orch.read_session(_P(droot) / "nope.jsonl") == "")
 
     # ---------------- 收尾 ----------------
     print("\n==== %d 项失败 ====" % len(FAILED))

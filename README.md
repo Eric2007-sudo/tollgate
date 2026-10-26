@@ -34,13 +34,15 @@
   （上下文多大、多少钱、还撑几轮、该不该换干净会话）。
 - **一个编排层** `orch.py`：多角色并发之前先踩四道刹车——路数、目录重叠、依赖链深度、契约在不在，
   再过一遍**开工七问**（谁是大脑、每路做什么、谁合……缺一项就拒派发）。
-  它只经 `subprocess` 调 `tg --json`，不 import 内部、不派发进程。
+  `fan` 只出简报（一个进程都不起），`dispatch` 才照简报起 N 个 headless 会话、
+  按**会话 id 点名归账**、超预算就停手。它只经 `subprocess` 调 `tg --json`，不 import 内部。
 - **一个只读工作台**：标准库 `http.server`，只绑 `127.0.0.1`，校验 Host 头。
 
 **不是什么**（写在这里，省得你试完才发现）
 
-- **不是 agent runtime / 进程调度器**。不派发任务、不起子进程跑 agent、不接管生命周期。
-  派发是主会话那个 agent 的事；`orch fan` 只**准备**简报，不执行。
+- **不是 agent runtime。** 不排队、不重试到成功为止、不接管会话生命周期、不管工具权限。
+  `orch dispatch` 只做一件事：把已经过检的简报交给 `opencode run`，收 exit code 与会话 id。
+  不打这个子命令，它一个进程都不起；`fan` 永远只准备简报。
 - **不是模型网关。** 不改路由、不接你的 key、不代理请求。`--tier` 只是标签，真要换模型是在会话里换。
 - **不是 spec-kit 的替代。** 不生成 spec 模板、不做需求澄清流程。
 - **不是公开的多人平台。** 单机自用；账本口径是「这台机器上这个 repo 花了多少」，
@@ -290,15 +292,33 @@ $ tg gate 1 --timeout 1
 
 `tg` 管「这一步做完了吗」和「花了多少钱」。当你要**几个 agent 同时干活**时，还会多出三个
 问题：谁负责哪块、并发几路、各自说的"做好了"算不算数。`orch.py` 只管这三件，它
-**不调模型、不起进程、不改计划**，只经 `subprocess` 吃 `tg` 的 `--json` 契约。
+**不看代码、不写产物、不评质量**，只经 `subprocess` 吃 `tg` 的 `--json` 契约，
+再用同一份契约把活交给 `opencode run`。
 
 ```bash
-python orch.py role add backend  --dir api/ --task "产出 api 的字段与路由" --lead --merge "谁看、谁合、合不上怎么办"
-python orch.py role add frontend --dir web/ --task "出界面，只调已定字段"   # 角色 = 一个它独占的目录
+python orch.py role add lead     --dir plan/ --task "拍板：契约、拆分、合并" --lead --merge "谁看、谁合、合不上怎么办"
+python orch.py role add backend  --dir api/  --task "产出 api 的字段与路由"
+python orch.py role add frontend --dir web/  --task "出界面，只调已定字段"   # 角色 = 一个它独占的目录
 python orch.py role list                   # 顺带把「开工七问答到哪了」摊开
-python orch.py fan 2                       # 派发前踩刹车，过了就一人一份自足式简报
+python orch.py fan 2                       # 只出简报：派发前踩刹车，过了就一人一份自足式简报
+python orch.py dispatch 2 --concurrency 2  # 真派发：按简报起会话，分批跑，自动点名归账
 python orch.py rollup --gate --cost        # 收工后三层汇总：断言 / 语义 / 人
 ```
+
+`fan` 和 `dispatch` 的检查是**同一段代码**（`prepare_fan()`）：凡是 `fan` 会拦的，
+`dispatch` 一行都绕不过去——两套检查迟早会不一致，然后并发就会在没人拦的地方开跑。
+
+`dispatch` 只在三处做「派发器该做的事」，其余一概不碰：
+
+- **分批**：大脑先单独跑一批，其余按 `--concurrency` 切。两个数分开算——
+  `--max-fanout` 是「这一批**总共**派几路」（值不值得付这些钱），
+  `--concurrency` 是「**同时**跑几路」（4 路并发 2 = 分两批）。
+  合并成一个数会逼人「想省时就得一次全烧」。
+- **归账点名**：每路跑完立刻 `tg sync --step N --session <它的会话 id>`。
+  这里**必须**显式点名：子会话环境里的 `OPENCODE_SESSION_ID` 指的是主会话，不是它自己——
+  实测过一次默认值把主会话的 20 轮 / 129 516 input 记到某一路头上，那一路的预算当场超 16 倍。
+- **钱到顶就停手**：每批跑完读一次账本，`--max-usd` 超了就不再开下一批，剩下的路宁可不跑。
+  返工回路（`--retries`，默认 1）在**原会话**里补跑，不重开会话——重开等于重付一遍上下文。
 
 派发前踩的四道刹车：**并发路数**（默认 2）、**目录重叠**、**依赖链深度**（默认 3）、
 **契约文件在不在**。路数上限不是性能旋钮：Anthropic 的多 agent 系统是 15× token 换
@@ -465,11 +485,11 @@ reviewer 只出概率、人只在两层打架时介入。`orch rollup` 会把三
 python tests/test_tg.py        # 213 项：计划 / 门禁 / 预算口径 / 兼容 / 简报带用量 / BOM 容错 / 假警告 / 断言超时 / --json 接缝 / doing 多值与并发上限 / 依赖链深度与成环 / 花费上限到顶拒绝
 python tests/test_ctx.py       # 25 项：逐轮口径 / 增速 / 比价 / 无数据不编数
 python tests/test_sync.py      # 115 项：对账口径 / 幂等 / 增量 / dry-run / 游标容错 / report / done 提醒 / 轮次不谎报 / force 重建 / 别的会话没入账 / 交替会话不重记 / 账本行带会话来源 / 归账边界 / 多路并发不猜归属
-python tests/test_orch.py      # 123 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 开工七问硬拦 / 简报内容（含「谁的断言归谁」） / --json 纯度 / 三层分列 / verdict 不改状态 / 逐条数人确认（含全绿后的说法）
+python tests/test_orch.py      # 150 项：角色契约 / 目录重叠拒绝 / 路数·深度·契约四道刹车 / 开工七问硬拦 / 简报内容（含「谁的断言归谁」） / --json 纯度 / 三层分列 / verdict 不改状态 / 逐条数人确认（含全绿后的说法） / dispatch 的分批与 dry-run 不花钱 / 派发消息必须单行 / 会话 id 只从 NDJSON 取
 python tests/smoke_serve.py    # 55 项：真起服务、真打请求、Host 头校验、钱与对账上屏、同期在花、钱按会话分列、/api/reviews 的人确认进度（无逐条数据 ≠ 0 条、坏文件不许静默跳过）
 ```
 
-合计 **531 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
+合计 **558 项**，全部离线可复现：`test_ctx.py` / `test_sync.py` 用构造出来的同构 sqlite 库，不碰真实宿主数据；`test_orch.py` 用临时目录里造的计划，一个模型都不调。
 
 数字本身也有人盯着——README 曾经把 `test_sync.py` 写成 56 项，实际只有 53 项：
 

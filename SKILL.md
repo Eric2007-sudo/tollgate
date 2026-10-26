@@ -121,20 +121,25 @@ sync 之后新跑掉的轮次补记上"。想核对它有没有漏记，`tg ctx`
 ## 多角色并发：`orch.py`（另一层，不是另一套闸）
 
 要**几个 agent 同时干活**时才用。它只管三件事：谁负责哪块、并发几路、各自说的"做好了"
-算不算数。**不调模型、不起进程、不改计划**，只经 `subprocess` 吃 `tg --json` 的契约。
+算不算数。**不看代码、不写产物、不评质量**，只经 `subprocess` 吃 `tg --json` 的契约；
+`fan` 只出简报，`dispatch` 才照简报起 headless 会话。
 
 | 命令 | 用途 |
 |---|---|
 | `orch role add <名> --dir <目录> --reviewer jev` | 角色 = 一个它**独占**的目录。目录重叠直接拒（一重叠就是抢文件，不是并发） |
 | `orch fan <步骤>` | 派发前踩四道刹车：路数（默认 2）/ 目录重叠 / 依赖深度（默认 3）/ 契约在不在。过了就一人一份自足式简报 |
+| `orch dispatch <步骤>` | 真派发：分批起 `opencode run`，按**会话 id 点名归账**，`--max-usd` 到顶就停手，`--retries` 在原会话里补跑 |
 | `orch rollup [--gate] [--cost]` | 三层分列汇总：断言（exit code 说话）/ 语义（reviewer 只出概率）/ 人（只在两层打架时介入） |
 
-三条不许破的：
+四条不许破的：
 
 1. **报告里不许出现「AI 评价通过」。** 两层分列打印，合起来写迟早有人拿语义 verdict 当验收依据。
 2. **`jev` 的 `pass` 在人工抽查验证之前不得当作 `done` 依据。** `rollup` 会把「评了几次 /
    抽查了几次」摆出来，没抽查满就一直警告。
 3. **没查就说没查。** `rollup` 不给 `--gate` 时不做打架检测，并明说「没查不等于没打架」。
+4. **归账必须点名会话**（`tg sync --session <id>`）。子会话环境里的 `OPENCODE_SESSION_ID`
+   指的是**主会话**，拿默认值归账就是把主会话的钱记到这一路头上（实测超预算 16 倍）。
+   `orch dispatch` 从 `opencode run` 的 JSON 流里取真实会话 id，所以它不踩这个坑。
 
 `orch` 的 stdout 是机器契约：**人类提示一律走 stderr**（警告同时进 payload 的 `warnings`）。
 细节见 `references/orchestration.md`。

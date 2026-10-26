@@ -101,7 +101,7 @@ if ($python) {
     Write-Host "  python `"$tg`""
     Write-Host "  python `"$tg`" serve --port 7717    # 本地工作台"
     Write-Host "  python `"$(Join-Path $dest 'orch.py')`"" -ForegroundColor Green
-    Write-Host "  python `"$(Join-Path $dest 'orch.py')`" fan 2    # 多角色编排（不调模型）"
+    Write-Host "  python `"$(Join-Path $dest 'orch.py')`" fan 2    # 多角色编排（只出简报，不调模型）"
 } else {
     Write-Host "未找到 python。技能文件已就位，但 CLI 需要 Python 3.8+。" -ForegroundColor Yellow
 }

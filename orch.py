@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""orch —— 多角色编排层。零依赖，只经 subprocess 调 tg 的 CLI，只吃它的 --json 契约。
+"""orch —— 多角色编排层。零依赖，只经 subprocess 调 tg 的 CLI + 起 opencode 会话。
 
-它**不是**进程调度器，**不是** agent runtime，**不调模型**：
+它**自己不看代码、不写产物、不评质量**：
 
     role add / role list   把「谁负责哪个目录、谁来评」落盘成一份可以吵的契约
     fan <step>             派发前先查一遍：并发路数、目录重叠、依赖深度、契约在不在；
-                           全过了才给每个角色生成一份自足式简报，并打印该跑的 tg 命令
+                           全过了才给每个角色生成一份自足式简报
+    dispatch <step>        真派发：照简报起 N 个 headless 会话（opencode run），
+                           收 exit code、按会话 id 点名归账、超预算就停手
     rollup                 收工后把「断言层 / 语义层 / 人」三层分开汇总
 
-三条不让步的规矩：
+`dispatch` 是**显式**的：不打这个子命令，orch 一个会话都不起。
+`fan` 永远只出简报 —— 先看清要派什么，再决定花钱。
+
+四条不让步的规矩：
   1. 门控生死**只认 exit code**。review-*.json 里的 verdict 是概率，不是结论，
      任何时候都不许拿它替代 `tg done`。
   2. 并发的安全边界是**目录边界**。两个角色的目录一重叠，就等于没切。
   3. 并发路数有硬上限（默认 2）。多智能体烧的是 token 不是时间——
      Anthropic 实测 15×、MAST 调查里头号失败模式就是 cost runaway。
+  4. 归账必须**点名会话**（`sync --session`）。子会话环境里的 OPENCODE_SESSION_ID
+     指的是**主会话**，不是它自己 —— 这是实测出来的坑（默认值会把主会话的
+     20 轮、129k input 记到某一路头上），不是理论风险。
 
 跑法：python orch.py <命令> ...
       tg.py 默认找同目录、ORCH_TG、或 ~/.config/opencode/skills/tollgate/tg.py
@@ -24,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -93,13 +102,17 @@ def tg_path():
     die("找不到 tg.py。它该和 orch.py 放在一起，或设 ORCH_TG 指过去。")
 
 
-def tg_json(args, root):
+def tg_json(args, root, json_flag=True):
     """调一条 tg 的 --json 命令，返回 (payload, exitcode)。
+
+    `--json` 不是每条 tg 子命令都认（`tg start` 就没有）：给它 json_flag=False，
+    否则 argparse 会以 exit 2 拒绝，而你会以为是「预算到顶」——
+    这种「闸说不行、其实是命令写错了」的误判比没有闸更危险。
 
     解析不了就是 None —— **不猜、不从人类可读输出里抠数字**。
     抠出来的数看着像真的，错的时候没人查得出来。
     """
-    argv = [sys.executable, str(tg_path()), *args, "--json"]
+    argv = [sys.executable, str(tg_path()), *args] + (["--json"] if json_flag else [])
     try:
         r = subprocess.run(argv, cwd=str(root), capture_output=True, text=True,
                            encoding="utf-8", errors="replace")
@@ -455,8 +468,13 @@ BRIEF_TMPL = """# 简报 · #{n} {title} · 角色 `{role}`
 """
 
 
-def cmd_fan(a):
-    root = find_root()
+def prepare_fan(a, root):
+    """fan 和 dispatch 共用的「派发前检查 + 简报生成」。
+
+    拿到返回字典就说明这一批可以派了：里面任何一项不合格都已经 die 掉。
+    dispatch 不许另写一套检查 —— 两套检查迟早会不一致，
+    然后并发就会在没人拦的地方开跑。
+    """
     status = need_plan(root)
     st = load_roles(root)
 
@@ -547,12 +565,19 @@ def cmd_fan(a):
     # ⑥ 现状提醒：doing 最多 DEFAULT_MAX_FANOUT 路，但每路必须是独立会话
     others_doing = [n for n in status.get("doing", []) if n != a.step]
     if others_doing or len(roles) > 1:
-        warn("并发的前提是**每路一个独立会话**。tg 允许最多 %d 步同时 doing"
-             "（默认 2 路，第 3 路要 tg start N --max-fanout 3）：\n"
-             "    每路各开一个 subagent 会话 → 在**自己的会话里** tg start <n> 拿归账边界\n"
-             "    → 收工 tg gate <n> 点名验、tg sync --step <n> --session <sid> 点名归账。\n"
-             "    两路塞进同一个会话是最坏的情况：轮次混在一起，点谁的名都是猜。"
-             % DEFAULT_MAX_FANOUT)
+        if getattr(a, "cmd", "") == "dispatch":
+            # dispatch 已经把这四件事全包了，再念一遍手动版指令只会让人以为要自己做。
+            warn("并发的前提是**每路一个独立会话**：dispatch 会为每一路各起一个，"
+                 "并按 %d 路一批往下走。\n"
+                 "    start / 归账 / 点名验都由它做，你只需要看最后那行 exit code。"
+                 % (getattr(a, "concurrency", None) or limit))
+        else:
+            warn("并发的前提是**每路一个独立会话**。tg 允许最多 %d 步同时 doing"
+                 "（默认 2 路，第 3 路要 tg start N --max-fanout 3）：\n"
+                 "    每路各开一个 subagent 会话 → 在**自己的会话里** tg start <n> 拿归账边界\n"
+                 "    → 收工 tg gate <n> 点名验、tg sync --step <n> --session <sid> 点名归账。\n"
+                 "    两路塞进同一个会话是最坏的情况：轮次混在一起，点谁的名都是猜。"
+                 % DEFAULT_MAX_FANOUT)
 
     # 步骤级 stop 里点名某个角色时，另外几路读到的那句是噪音 —— 明说出来。
     # 上一轮真跑的简报里，tester 的边界上挂着「前端拿不到契约里的字段就停下来」，
@@ -646,12 +671,27 @@ def cmd_fan(a):
                       "语义层的 verdict 与概率都不构成 done 依据"],
     }
 
+    return {
+        "step": step, "roles": roles, "briefs": briefs, "limit": limit,
+        "depth": depth, "contract": contract, "lead": lead, "merge": merge,
+        "st": st, "status": status, "all_accept": all_accept, "own_of": own_of,
+        "preflight": preflight,
+    }
+
+
+def cmd_fan(a):
+    root = find_root()
+    ctx = prepare_fan(a, root)
+    step, roles, briefs = ctx["step"], ctx["roles"], ctx["briefs"]
+    contract, lead, merge = ctx["contract"], ctx["lead"], ctx["merge"]
+    limit, depth, st = ctx["limit"], ctx["depth"], ctx["st"]
+
     if a.json:
         out(json.dumps({
             "api": ORCH_JSON_API, "cmd": "fan", "ok": True,
             "step": step["n"], "title": step["title"], "depth": depth,
             "max_fanout": limit, "roles": roles, "briefs": briefs,
-            "contract": contract, "preflight": preflight,
+            "contract": contract, "preflight": ctx["preflight"],
             "warnings": list(WARNINGS),
             "dispatch": [{"role": r, "dir": dir_disp(root, st["roles"][r]["dir"]),
                           "brief": briefs[r],
@@ -678,13 +718,307 @@ def cmd_fan(a):
         out("  %-12s %s   （只碰 %s）"
             % (role, briefs[role], dir_disp(root, st["roles"][role]["dir"])))
     out("")
-    out("接下来（orch 不替你派 agent —— 它不调模型、不管进程）：")
-    out("  1. 用上面每份简报的全文，各开一个 subagent（同一批工具调用里发出去才是真并发）")
-    out("  2. 第一路拿边界：tg start %d" % step["n"])
-    out("  3. 每路收工后各自归账：tg sync --step %d --session <该 subagent 的会话 id>"
+    out("接下来，两条路选一条：")
+    out("  A. 让机器派（推荐）：python orch.py dispatch %d --concurrency 2" % step["n"])
+    out("     它自己 start、起会话、按会话 id 点名归账、超 --max-usd 就停手。")
+    out("  B. 自己派：用上面每份简报的全文各开一个 subagent")
+    out("     （同一批工具调用里发出去才是真并发），然后手动走下面 1–4：")
+    out("  1. 第一路拿边界：tg start %d" % step["n"])
+    out("  2. 每路收工后各自归账：tg sync --step %d --session <该 subagent 的会话 id>"
         % step["n"])
-    out("  4. 验收：tg gate %d --json（exit code 说话）" % step["n"])
-    out("  5. 全部通过再 tg done %d，然后 orch rollup 看三层汇总" % step["n"])
+    out("     ——**必须点名会话**：子会话里的 OPENCODE_SESSION_ID 是主会话，默认值会记错账")
+    out("  3. 验收：tg gate %d --json（exit code 说话）" % step["n"])
+    out("  4. 全部通过再 tg done %d，然后 orch rollup 看三层汇总" % step["n"])
+
+
+# ---------------------------------------------------------------- dispatch
+
+# 派发消息**永远是一行**，只点名简报文件，不塞简报正文。
+# 原因不是「省长度」，是 Windows 上 opencode 是 .CMD 包装脚本：多行参数会被 cmd.exe
+# 当成多条命令，`--format json` 随之失效 —— 实测多行消息时整个 JSON 流变成人看的
+# TUI 渲染（带 ANSI 色），会话 id 就挖不到了，账也就归不上。单行绕开这一整类问题。
+SID_RE = re.compile(r'"sessionID"\s*:\s*"(ses_[A-Za-z0-9]+)"')
+
+
+def opencode_bin():
+    p = shutil.which("opencode")
+    if not p:
+        die("PATH 里找不到 opencode。dispatch 靠它起会话；\n"
+            "    只想看它准备跑什么，加 --dry-run（一次进程都不起）。")
+    return p
+
+
+def plan_batches(roles, limit, lead):
+    """大脑先单独跑一轮，其余按 limit 分批。
+
+    大脑和别人同批发出去，等于让其余几路读半成品 —— 而它们的简报里写着
+    「契约为准、不够用就停下来汇报」，于是它们会合理地停下来等你。
+    分批是省返工，不是省时间。
+    """
+    rest = list(roles)
+    batches = []
+    if lead and lead in rest and len(rest) > 1:
+        batches.append([lead])
+        rest.remove(lead)
+    while rest:
+        batches.append(rest[:limit])
+        rest = rest[limit:]
+    return batches
+
+
+def dispatch_message(root, brief_rel, role):
+    """给一路的消息：**一行**，只点名简报文件 —— 不塞正文（理由见上面那段注释）。
+
+    简报里的禁区写着 `.plan/`、`.orch/`「只读不写」，所以让它去读自己那份简报不算越界。
+    """
+    disp = str((root / brief_rel)).replace("\\", "/")
+    return ("你的简报在 `%s` ：先完整读一遍再动手，别凭标题猜。"
+            "账和边界由派发器处理 —— 不要自己跑 tg sync，也不要 tg start / tg done。"
+            "只写你自己那个目录，写完就停。" % disp)
+
+
+def spawn_role(opencode, root, role, info, message, a, logpath, session=None):
+    """起一路（或续一路）。返回 (proc, 日志句柄)。"""
+    argv = [opencode, "run", message, "--agent", a.agent,
+            "--title", "%s@%s" % (role, root.name),
+            "--format", "json", "--auto"]
+    if a.model:
+        argv += ["--model", a.model]
+    if session:
+        argv += ["--session", session]
+    d = root / info["dir"]
+    argv.append(str(d))
+    logpath.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(logpath, "wb")
+    try:
+        proc = subprocess.Popen(argv, cwd=str(d), stdout=fh, stderr=subprocess.STDOUT)
+    except OSError as e:
+        fh.close()
+        die("起不动 %s 这一路：%s" % (role, e))
+    return proc, fh
+
+
+def read_session(logpath):
+    """从 --format json 的日志里挖会话 id。挖不到就返回 ""，不猜。"""
+    try:
+        txt = logpath.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = SID_RE.search(txt)
+    return m.group(1) if m else ""
+
+
+def cmd_dispatch(a):
+    root = find_root()
+    ctx = prepare_fan(a, root)
+    step, roles, st = ctx["step"], ctx["roles"], ctx["st"]
+    limit, lead, n = ctx["limit"], ctx["lead"], step["n"]
+    # 两个数不是一回事：
+    #   limit（--max-fanout）= 这一批**总共**派几路，是「值不值得付这些钱」的上限
+    #   conc（--concurrency） = **同时**跑几路，是分批的依据
+    # 4 路并发 2 就是两批。合并成一个数会逼人「想省时间就得一次全烧」。
+    conc = a.concurrency or limit
+    if conc < 1:
+        die("--concurrency 至少是 1（同时跑几路）。要一路一路跑就写 1，别写 0。")
+    model = (a.model or os.environ.get("ORCH_MODEL") or "").strip()
+
+    def say(msg=""):
+        # --json 时 stdout 只许有 JSON：人看的进度一律压掉，不是转到 stderr
+        # （那是给「出错和警告」用的，进度不是）。真要看得加 --verbose。
+        if not a.json:
+            out(msg)
+
+    opcode = None if a.dry_run else opencode_bin()
+
+    # 归账边界：sync 按「这步什么时候开始」切轮次。没 start 就派发，
+    # 等会儿归账要么切在计划创建那一刻（把别人早先的轮次也算进来），要么直接报错。
+    started = False
+    if step["status"] != "doing":
+        if a.dry_run:
+            warn("#%d 现在还不是 doing；真跑时派发器会先 `tg start %d` 拿归账边界。"
+                 % (n, n))
+        else:
+            _s, rc = tg_json(["start", str(n)], root, json_flag=False)
+            if rc != 0:
+                die("`tg start %d` 没通过（exit=%d）。预算到顶、依赖没完成、"
+                    "或者同时 doing 的步数超限 ——\n    dispatch 不绕过 tg 的闸，"
+                    "先 `tg status` 看是哪一种。" % (n, rc))
+            started = True
+
+    batches = plan_batches(roles, conc, lead)
+    runs = []
+    stop_reason = ""
+    total_usd = 0.0
+    run_dir = orch_dir(root) / "runs"
+    planned_flat = []
+
+    for bi, batch in enumerate(batches, 1):
+        say("== 第 %d/%d 批：%s ==" % (bi, len(batches), "、".join(batch)))
+        planned = []
+        for role in batch:
+            info = st["roles"][role]
+            msg = dispatch_message(root, ctx["briefs"][role], role)
+            argv = ["opencode", "run", "<%d 字的消息>" % len(msg),
+                    "--agent", a.agent, "--title", "%s@%s" % (role, root.name),
+                    "--format", "json", "--auto"]
+            if model:
+                argv += ["--model", model]
+            argv.append(str((root / info["dir"]).resolve()))
+            planned.append({"role": role, "dir": dir_disp(root, info["dir"]),
+                            "argv": argv, "message_chars": len(msg), "msg": msg})
+        planned_flat.extend(planned)
+        if a.dry_run:
+            for p in planned:
+                say("  %-12s 在 %s" % (p["role"], p["dir"]))
+                say("      " + " ".join(p["argv"]))
+            continue
+
+        procs = []
+        for p in planned:
+            role, info = p["role"], st["roles"][p["role"]]
+            d = root / info["dir"]
+            if not d.is_dir():
+                warn("%s 这一路的目录 %s 还不存在，已建空目录（否则会话没有工作目录）。"
+                     % (role, dir_disp(root, info["dir"])))
+                d.mkdir(parents=True, exist_ok=True)
+            logpath = run_dir / ("%d-%s-%s.jsonl"
+                                 % (n, role, time.strftime("%H%M%S")))
+            proc, fh = spawn_role(opcode, root, role, info, p["msg"], a, logpath)
+            procs.append((role, proc, fh, logpath, now_iso()))
+            say("  派发 %-12s → %-16s pid %d"
+                % (role, dir_disp(root, info["dir"]), proc.pid))
+
+        # 全部起完之后才 wait：先起再等才是并发，边起边等就是串行。
+        for role, proc, fh, logpath, t0 in procs:
+            try:
+                rc = proc.wait(timeout=a.timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = -9
+                warn("%s 超时 %d 秒，已杀掉（日志 %s）。"
+                     % (role, a.timeout, logpath.name))
+            fh.close()
+            sid = read_session(logpath)
+            rec = {"role": role, "dir": dir_disp(root, st["roles"][role]["dir"]),
+                   "session": sid or None, "exit": rc, "retries": 0,
+                   "log": str(logpath.relative_to(root)).replace("\\", "/"),
+                   "started": t0, "ended": now_iso(),
+                   # 「归上了账」和「跑通了」是两件事。没归上就等于这一路的钱
+                   # 花了但账本里没有 —— 账本撒谎比缺一路更坏，所以不许算 ok。
+                   "accounted": bool(sid),
+                   "synced_rounds": None, "cost_usd": None}
+            if sid:
+                s, src = tg_json(["sync", "--step", str(n), "--session", sid], root)
+                if s is not None:
+                    sy = s.get("synced") or {}
+                    rec["synced_rounds"] = sy.get("reqs")
+                    rec["cost_usd"] = s.get("cost")
+                    if not sy.get("reqs"):
+                        warn("%s 的会话里没有可归账的轮次（多半整轮都发生在 start 之前）。"
+                             % role)
+                else:
+                    warn("%s 的账没归上：`tg sync --json` 解析不了（exit=%d）。"
+                         "这一路的花费不在账本里。" % (role, src))
+            else:
+                warn("%s 没拿到会话 id（日志里没有 sessionID），账没归 —— "
+                     "去 %s 看它到底干了什么。" % (role, logpath.name))
+            runs.append(rec)
+            say("  %-12s exit=%-3s 轮次=%-4s cost=%s"
+                % (role, rc, rec["synced_rounds"] if rec["synced_rounds"] is not None else "-",
+                   ("$%.6f" % rec["cost_usd"]) if rec["cost_usd"] else "-"))
+
+        rep, _rc = tg_json(["report"], root)
+        if rep:
+            total_usd = float((rep.get("totals") or {}).get("cost_usd") or 0.0)
+        if a.max_usd is not None and total_usd > a.max_usd:
+            stop_reason = ("第 %d 批之后账本已 $%.6f > 上限 $%.6f，剩下的批次不派了"
+                           % (bi, total_usd, a.max_usd))
+            warn(stop_reason + "。要接着跑就调 --max-usd。")
+            break
+
+    # 返工回路：没跑通的那一路，在**原会话**里补跑 —— 重开会话等于重付一遍上下文。
+    # 只补跑不改判据：改的还是同一份简报、同一批断言。
+    if not a.dry_run and a.retries > 0:
+        for rec in list(runs):
+            tries = 0
+            while rec["exit"] != 0 and tries < a.retries and rec["session"]:
+                tries += 1
+                rec["retries"] = tries
+                msg = ("上一轮没跑通（exit=%s）。不要重头再来：先 `tg status` 看第 %d 步，"
+                       "再补完简报里没做完的部分。收工的唯一标准是简报里点名给你那几条断言全绿。"
+                       % (rec["exit"], n))
+                logpath = run_dir / ("%d-%s-retry%d-%s.jsonl"
+                                     % (n, rec["role"], tries, time.strftime("%H%M%S")))
+                proc, fh = spawn_role(opcode, root, rec["role"],
+                                      st["roles"][rec["role"]], msg, a, logpath,
+                                      session=rec["session"])
+                say("  返工 %-12s（第 %d 次）" % (rec["role"], tries))
+                try:
+                    rc = proc.wait(timeout=a.timeout)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    rc = -9
+                fh.close()
+                rec["exit"] = rc
+                s, _src = tg_json(["sync", "--step", str(n), "--session", rec["session"]], root)
+                if s is not None:
+                    rec["cost_usd"] = s.get("cost")
+            if rec["retries"]:
+                say("  %-12s 返工 %d 次后 exit=%s" % (rec["role"], rec["retries"], rec["exit"]))
+
+    failed = [r for r in runs if r["exit"] != 0]
+    unaccounted = [r["role"] for r in runs if not r.get("accounted")]
+    ok = (not failed) and (not unaccounted) and (not stop_reason)
+    state = load_state(root)
+    state.setdefault("dispatches", []).append({
+        "ts": now_iso(), "step": n, "roles": roles, "batches": batches,
+        "model": model or None, "agent": a.agent, "dry_run": bool(a.dry_run),
+        "started_by_dispatch": started, "runs": runs,
+        "total_usd": total_usd or None, "stop_reason": stop_reason or None,
+    })
+    save_state(root, state)
+
+    nxt = ["tg gate %d --json（exit code 说话）" % n,
+           "全绿再 tg done %d" % n,
+           "orch rollup --gate --cost"]
+
+    if a.json:
+        out(json.dumps({
+            "api": ORCH_JSON_API, "cmd": "dispatch", "ok": ok,
+            "step": n, "title": step["title"], "dry_run": bool(a.dry_run),
+            "model": model or None, "agent": a.agent,
+            "max_fanout": limit, "concurrency": conc, "roles": roles,
+            "batches": [{"batch": i + 1, "roles": b} for i, b in enumerate(batches)],
+            "started_by_dispatch": started,
+            "runs": runs, "failed": [r["role"] for r in failed],
+            "unaccounted": unaccounted,
+            "total_usd": total_usd or None, "stop_reason": stop_reason or None,
+            "planned": planned_flat,
+            "warnings": list(WARNINGS), "next": nxt,
+        }, ensure_ascii=False, indent=1))
+        return 0 if ok else 1
+
+    if a.dry_run:
+        out("")
+        out("这是 dry-run：一个进程都没起、账本一个字没动。去掉 --dry-run 才真派。")
+        return 0
+
+    out("")
+    if stop_reason:
+        out("停手：" + stop_reason)
+    if failed:
+        out("没跑通：%s —— 断言层还没到，别急着 tg done。" % "、".join(r["role"] for r in failed))
+    if unaccounted:
+        out("账没归上：%s —— 这些路真花了钱，但账本里没有，不算通过（先看日志再 tg sync）。"
+            % "、".join(unaccounted))
+    if not failed and not unaccounted:
+        out("每一路都 exit 0，账也都点名归上了。但 exit 0 只是「它说自己干完了」，生死看门禁。")
+    out("账本这一轮：$%.6f（下限，没归上的会话不在里面）" % total_usd)
+    out("")
+    out("接下来：")
+    for x in nxt:
+        out("  · " + x)
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- rollup
@@ -917,7 +1251,7 @@ def main():
 
     ap = argparse.ArgumentParser(
         prog="orch",
-        description="多角色编排层：只经 tg 的 CLI + --json 契约，不调模型、不管进程")
+        description="多角色编排层：fan 只出简报（不派发），dispatch 才起会话（不评质量）")
     ap.add_argument("--version", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
 
@@ -946,6 +1280,26 @@ def main():
     p.add_argument("--contract", help="契约文件路径；默认自动找已完成步骤里产出的 .md")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("dispatch", help="真派发：照简报起 N 个 headless 会话，自动点名归账")
+    p.add_argument("step", type=int)
+    p.add_argument("--roles", help="逗号分隔；默认全部已登记角色")
+    p.add_argument("--max-fanout", type=int, default=None,
+                   help="这次最多几路（默认取 .orch/roles.json 里的 %d）" % DEFAULT_MAX_FANOUT)
+    p.add_argument("--concurrency", type=int, default=None,
+                   help="同时跑几路（默认 = --max-fanout；4 路并发 2 就是分两批）")
+    p.add_argument("--contract", help="契约文件路径；默认自动找已完成步骤里产出的 .md")
+    p.add_argument("--model", default=None,
+                   help="provider/model#variant；默认取 $ORCH_MODEL，再退 opencode 默认（当前是中转）")
+    p.add_argument("--agent", default="general", help="用哪个 agent 起会话（默认 general）")
+    p.add_argument("--retries", type=int, default=1,
+                   help="某一路 exit!=0 时，在**原会话**里补跑几次（默认 1；0 = 不补）")
+    p.add_argument("--timeout", type=int, default=2400, help="单路最多跑多少秒（默认 2400）")
+    p.add_argument("--max-usd", type=float, default=None,
+                   help="本轮累计花费上限（美元，账本口径）；超了就不再开下一批")
+    p.add_argument("--dry-run", action="store_true",
+                   help="只打印会执行的命令，不起进程、不动账本")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("rollup", help="三层汇总：断言 / 语义 / 人（不许混着说）")
     p.add_argument("--step", type=int, default=None)
     p.add_argument("--gate", action="store_true",
@@ -956,7 +1310,7 @@ def main():
     a = ap.parse_args()
 
     if getattr(a, "version", False) or not a.cmd:
-        out("orch 0.2.1（tg --json api %d）  零依赖 · 不调模型 · 不管进程"
+        out("orch 0.3.0（tg --json api %d）  零依赖 · 不评质量 · dispatch 才起会话"
             % TG_JSON_API)
         if not a.cmd:
             ap.print_help()
@@ -974,6 +1328,9 @@ def main():
     if a.cmd == "fan":
         cmd_fan(a)
         return 0
+
+    if a.cmd == "dispatch":
+        return cmd_dispatch(a)
 
     if a.cmd == "rollup":
         cmd_rollup(a)
