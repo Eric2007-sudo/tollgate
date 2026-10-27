@@ -98,12 +98,19 @@ def reviews_in(files):
 
 def check_reviews():
     """/api/reviews：人确认进度只读，null 是「没有逐条数据」，不是「0 条确认」。"""
-    # 1) 全绿形状：真实仓库里这个端点就得能出数据，六个键一个不少
-    status, raw = get("/api/reviews")
+    # 1) 全绿形状：六键一个不少。
+    #    数据必须**自己造**在临时仓库里 —— 早先这里打的是真实仓库根，
+    #    依赖 `.plan/review-*.json` 存在；而 `.plan/` 是 `.gitignore` 掉的，
+    #    于是全新 clone 下来这条必然红（实测 55 项变 54 项、退出码 1）。
+    #    测试不该依赖「我这台机器上恰好有那个目录」。
+    status, doc = reviews_in({
+        "review-1.json": {"step": 1, "reviewer": "jev", "verdict": "pass",
+                          "human_verified": True,
+                          "human_confirmed_claims": {"confirmed": 2, "total": 2}},
+    })
     expect(status == 200, "/api/reviews 返回 200")
     if status != 200:
         return
-    doc = json.loads(raw.decode("utf-8"))
     expect(doc.get("cmd") == "reviews", "/api/reviews.cmd == reviews")
     rows = doc.get("reviews") or []
     expect(len(rows) >= 1, "/api/reviews.reviews 非空（%d 条）" % len(rows))
