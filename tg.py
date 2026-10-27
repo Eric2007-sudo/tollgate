@@ -892,17 +892,19 @@ def cmd_reset(a):
     plan = load(root)
     s = step_by_n(plan, a.n)
     s["status"] = "todo"
-    s["note"] = ""
+    # 不碰 note：note 是**简报正文**，不是运行状态。
+    # 早先这里无条件写 s["note"]=""，于是「amend 改简报 → reset 重跑」这个再正常不过
+    # 的动作会把刚写好的简报静默清空，而 orch dispatch 仍照常发一份没有正文的简报、
+    # 子会话照兜底句办事、exit 0、门禁还能全绿 —— 一轮工白烧。
+    keep_note = len(s.get("note") or "")
     s.pop("started_ms", None)          # 重新开始 = 归账边界重新算
     if a.rounds:
         s["rounds"] = 0
     plan["updated"] = now_iso()
     save(root, plan)
-    if a.rounds:
-        out("#%d 已重置为 todo，轮次计数清零" % s["n"])
-    else:
-        out("#%d 已重置为 todo（轮次计数保留，当前 %d 轮；加 --rounds 可清零）"
-            % (s["n"], s.get("rounds", 0)))
+    tail = "，轮次计数清零" if a.rounds else \
+        "（轮次计数保留，当前 %d 轮；加 --rounds 可清零）" % s.get("rounds", 0)
+    out("#%d 已重置为 todo%s；简报正文（note，%d 字）保留" % (s["n"], tail, keep_note))
 
 
 def cmd_block(a):
@@ -3240,7 +3242,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="tg", description="tollgate：agent 的过闸 —— 计划预算 · 上下文预算 · 本地账本")
     ap.add_argument("-V", "--version", action="version",
-                    version="tollgate 0.4.1（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
+                    version="tollgate 0.4.2（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="建立 .plan/")

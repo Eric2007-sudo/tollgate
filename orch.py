@@ -425,6 +425,7 @@ BRIEF_TMPL = """# 简报 · #{n} {title} · 角色 `{role}`
 
 {task}
 
+{step_note}
 只做这一件事。发现还得做别的 → **停下来汇报**，不要顺手把别人的目录也改了：
 「各自都对、合不上」就是从这里开始的。
 
@@ -484,6 +485,17 @@ def prepare_fan(a, root):
         die("计划里没有 #%d。跑 tg status 看有哪些步骤" % a.step)
     if step["status"] == "done":
         die("#%d 已经是 done。要重做先 tg reset %d" % (a.step, a.step))
+
+    # 没有正文的简报 = 派一路盲跑。它照样 exit 0、门禁照样可能全绿，
+    # 因为它会按模板里的兜底句「不写任何一路的产物」办事 —— 钱花了，活没干。
+    # 真发生过一次：amend --note 写好简报，紧跟的 reset 把 note 清空了。
+    # 所以这里必须硬拦，且要说清楚怎么补。
+    if not (step.get("note") or "").strip():
+        die("#%d 的简报正文（note）是空的 —— 派出去只会拿到一份没有要求的简报。\n"
+            "    先写清楚这一路要做什么：\n"
+            "      tg amend %d --note \"<这一路的具体要求>\"\n"
+            "    检查是否被谁清掉了：tg show %d"
+            % (a.step, a.step, a.step))
 
     if a.roles:
         roles = [r.strip() for r in a.roles.split(",") if r.strip()]
@@ -589,6 +601,12 @@ def prepare_fan(a, root):
             warn("停止条件点了 %s 的名：另外几路读到的那句不对它们生效（简报里已标成步骤级）。"
                  "要每路各有刹车，就写成不点名的，或者拆成两步。" % "、".join(named))
 
+    # 步骤 note = 这一步的具体要求，必须原样进简报（见下面 step_note 的拼法）。
+    note_txt = (step.get("note") or "").strip()
+    step_note = ("### 这一步的具体要求（步骤 `#%d` 的 note，原文照录）\n\n%s\n\n"
+                 "上面这段是本步的**具体要求**；与前面那句角色说明冲突时，以这段为准。\n"
+                 % (step["n"], note_txt)) if note_txt else ""
+
     # ⑥ 生成简报
     bdir = orch_dir(root) / "briefs"
     bdir.mkdir(parents=True, exist_ok=True)
@@ -631,6 +649,11 @@ def prepare_fan(a, root):
             n=step["n"], title=step["title"], role=role,
             dir_disp=dir_disp(root, st["roles"][role]["dir"]),
             task=st["roles"][role].get("task") or "（没写 —— 停下来要一句话再动手）",
+            # 步骤的 note 是「这一步具体要做什么」的唯一载体，必须进简报。
+            # 早先模板里没有这个占位符，于是 tg add/amend --note 写的几千字
+            # 一直存在 plan.json 里，却从没发给任何人；子会话只能按上面那句
+            # 角色兜底说明办事，产出一份「都判不可测」的契约，还照样 exit 0。
+            step_note=step_note,
             forbidden="\n".join(forbid),
             contract=("`%s`（先完整读一遍）" % contract) if contract
             else "**没有契约文件** —— 先停下来要一份，别自己发明字段名。",
@@ -1331,7 +1354,7 @@ def main():
     a = ap.parse_args()
 
     if getattr(a, "version", False) or not a.cmd:
-        out("orch 0.3.1（tg --json api %d）  零依赖 · 不评质量 · dispatch 才起会话"
+        out("orch 0.4.0（tg --json api %d）  零依赖 · 不评质量 · dispatch 才起会话"
             % TG_JSON_API)
         if not a.cmd:
             ap.print_help()

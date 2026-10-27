@@ -43,7 +43,14 @@ def main():
     with open(README, encoding="utf-8-sig") as fh:
         text = fh.read()
 
+    # README 支持两种写法，两种都认：
+    #   ① 代码块注释：python tests/test_tg.py       # 213 项
+    #   ② 表格行：    | `tests/test_tg.py` | 213 | ...
+    # 为什么加 ②：表格比注释好读，但校验器只认 ①，于是改成表格就会「找到 0 个」——
+    # 那时它不是发现了不一致，而是**什么都没检查**，却照样报错，容易被误读成 README 有问题。
     claims = re.findall(r"python\s+(tests/[\w.]+\.py)\s*#\s*(\d+)\s*项", text)
+    if not claims:
+        claims = re.findall(r"^\|\s*`?(tests/[\w.]+\.py)`?\s*\|\s*(\d+)\s*\|", text, re.M)
     ok(bool(claims), "README 里能读到各套件的项目数（找到 %d 个）" % len(claims))
 
     total = 0
@@ -55,6 +62,9 @@ def main():
         ok(got == want, "%s：README 写 %d 项，实测 %d 项" % (rel, want, got))
 
     m = re.search(r"合计\s*\*\*(\d+)\s*项\*\*", text)
+    if not m:
+        m = re.search(r"^\|\s*\*{0,2}合计\*{0,2}\s*\|\s*\*{0,2}(\d+)\*{0,2}\s*\|",
+                      text, re.M)
     ok(bool(m), "README 里有一行「合计 N 项」")
     if m:
         ok(int(m.group(1)) == total,

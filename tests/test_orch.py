@@ -116,26 +116,34 @@ def main():
     tg(["init", "orch 测试计划", "--why", "编排层得有个真计划才测得出来"], root)
     tg(["add", "--title", "契约", "--out", "contract/CONTRACT.md",
         "--rounds", "2", "--reuse", "existing",
+        "--note", "写出 contract/CONTRACT.md：字段名以它为准。",
         "--accept", "file:exists:contract/CONTRACT.md"], root)
     os.makedirs(os.path.join(root, "contract"), exist_ok=True)
     with open(os.path.join(root, "contract", "CONTRACT.md"), "w", encoding="utf-8") as fh:
         fh.write("# 契约\n\n字段名以这里为准。\n")
     tg(["start", "1"], root)
     tg(["done", "1"], root)
+    # 步骤的 --note 是「这一路要做什么」的唯一载体：orch 会把它原文照录进简报。
+    # 空 note 会被 prepare_fan 直接拒派（见 orch.py 里那段守卫的注释），
+    # 所以这里的夹具必须给 note，否则测的就不是真实用法了。
     tg(["add", "--title", "后端", "--out", "api/", "--rounds", "20",
         "--depends", "1", "--reuse", "new",
+        "--note", "写出 api/app.py。",
         "--accept", "file:exists:api/app.py"], root)
     tg(["add", "--title", "前端", "--out", "web/", "--rounds", "20",
         "--depends", "1", "--reuse", "new",
+        "--note", "写出 web/index.html。",
         "--accept", "file:exists:web/index.html"], root)
     # 故意不给 --accept：零断言步骤在 tg 那边 gate 是「通过」的，
     # orch 的 rollup 必须把它印成「既不算通过也不算破了」。
     tg(["add", "--title", "没断言的步骤", "--out", "tests/", "--rounds", "5",
-        "--depends", "1", "--reuse", "new"], root)
+        "--depends", "1", "--reuse", "new",
+        "--note", "写测试；本步故意不给断言。"], root)
     # 第五步是给「坏 review 文件」留的位子：坏文件必须能被报出来，
     # 而不能因为「这一步没有 review 文件」被静默跳过。
     tg(["add", "--title", "数据库", "--out", "db/", "--rounds", "5",
         "--depends", "1", "--reuse", "new",
+        "--note", "写出 db/schema.sql。",
         "--accept", "file:exists:db/schema.sql"], root)
 
     # ---------------- 角色：并发的安全边界是目录边界 ----------------
@@ -498,6 +506,7 @@ def main():
     droot = tempfile.mkdtemp(prefix="orch_disp_")
     tg(["init", "派发测试", "--why", "派发层不起真会话也得能验"], droot)
     tg(["add", "--title", "契约", "--out", "contract/C.md", "--rounds", "2",
+        "--note", "写出 contract/C.md 作为共同事实来源。",
         "--reuse", "existing", "--accept", "file:exists:contract/C.md"], droot)
     os.makedirs(os.path.join(droot, "contract"), exist_ok=True)
     with open(os.path.join(droot, "contract", "C.md"), "w", encoding="utf-8") as fh:
@@ -506,6 +515,7 @@ def main():
     tg(["done", "1"], droot)
     tg(["add", "--title", "三路并行", "--out", "out/", "--rounds", "20",
         "--depends", "1", "--reuse", "new",
+        "--note", "三路各写自己的目录：research/notes.md、web/index.html、api/app.py。",
         "--accept", "file:exists:research/notes.md",
         "--accept", "file:exists:web/index.html",
         "--accept", "file:exists:api/app.py"], droot)
@@ -561,6 +571,7 @@ def main():
     droot2 = tempfile.mkdtemp(prefix="orch_brake_")
     tg(["init", "刹车测试", "--why", "上限超了不许先花钱再停"], droot2)
     tg(["add", "--title", "契约", "--out", "contract/C.md", "--rounds", "2",
+        "--note", "写出 contract/C.md。",
         "--reuse", "existing", "--accept", "file:exists:contract/C.md"], droot2)
     os.makedirs(os.path.join(droot2, "contract"), exist_ok=True)
     with open(os.path.join(droot2, "contract", "C.md"), "w", encoding="utf-8") as fh:
@@ -568,6 +579,7 @@ def main():
     tg(["start", "1"], droot2)
     tg(["done", "1"], droot2)
     tg(["add", "--title", "一路", "--out", "out/", "--rounds", "4",
+        "--note", "写出 out/a.md。",
         "--depends", "1", "--reuse", "new", "--accept", "file:exists:out/a.md"], droot2)
     oc(["role", "add", "lead", "--dir", "plan/", "--lead", "--task", "拍板",
         "--merge", "lead 看，合不上就拆步"], droot2)
