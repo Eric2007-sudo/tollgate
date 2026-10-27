@@ -3242,7 +3242,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="tg", description="tollgate：agent 的过闸 —— 计划预算 · 上下文预算 · 本地账本")
     ap.add_argument("-V", "--version", action="version",
-                    version="tollgate 0.4.2（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
+                    version="tollgate 0.4.3（内核 plan-ledger v0.3 / schema %d）" % SCHEMA)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("init", help="建立 .plan/")
