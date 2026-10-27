@@ -853,7 +853,26 @@ def cmd_dispatch(a):
     run_dir = orch_dir(root) / "runs"
     planned_flat = []
 
+    # 刹车要在**花钱之前**踩。下面那处「批后检查」只能保证「超了就不再开下一批」，
+    # 一批就完事的任务里等于没有刹车：账本早就过了上限，第 1 批照样派出去，钱先花掉再说。
+    def brake_before_batch(bi):
+        nonlocal total_usd, stop_reason
+        if a.max_usd is None or a.dry_run:
+            return False
+        rep, _rc = tg_json(["report"], root)
+        if rep:
+            total_usd = float((rep.get("totals") or {}).get("cost_usd") or 0.0)
+        if total_usd > a.max_usd:
+            stop_reason = ("开第 %d 批之前账本已 $%.6f > 上限 $%.6f，"
+                           "一条会话都没起" % (bi, total_usd, a.max_usd))
+            warn(stop_reason + "。要接着跑就把 --max-usd 抬到账本之上"
+                 "（抬上限是用户的决定，不是编排层的）。")
+            return True
+        return False
+
     for bi, batch in enumerate(batches, 1):
+        if brake_before_batch(bi):
+            break
         say("== 第 %d/%d 批：%s ==" % (bi, len(batches), "、".join(batch)))
         planned = []
         for role in batch:
@@ -1296,7 +1315,8 @@ def main():
                    help="某一路 exit!=0 时，在**原会话**里补跑几次（默认 1；0 = 不补）")
     p.add_argument("--timeout", type=int, default=2400, help="单路最多跑多少秒（默认 2400）")
     p.add_argument("--max-usd", type=float, default=None,
-                   help="本轮累计花费上限（美元，账本口径）；超了就不再开下一批")
+                   help="账本累计花费上限（美元，含历史，不是「这一轮能花多少」）；"
+                        "每一批**开之前**都查一次，超了连第 1 批都不派")
     p.add_argument("--dry-run", action="store_true",
                    help="只打印会执行的命令，不起进程、不动账本")
     p.add_argument("--json", action="store_true")
@@ -1311,7 +1331,7 @@ def main():
     a = ap.parse_args()
 
     if getattr(a, "version", False) or not a.cmd:
-        out("orch 0.3.0（tg --json api %d）  零依赖 · 不评质量 · dispatch 才起会话"
+        out("orch 0.3.1（tg --json api %d）  零依赖 · 不评质量 · dispatch 才起会话"
             % TG_JSON_API)
         if not a.cmd:
             ap.print_help()

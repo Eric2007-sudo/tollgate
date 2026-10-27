@@ -128,7 +128,7 @@ sync 之后新跑掉的轮次补记上"。想核对它有没有漏记，`tg ctx`
 |---|---|
 | `orch role add <名> --dir <目录> --reviewer jev` | 角色 = 一个它**独占**的目录。目录重叠直接拒（一重叠就是抢文件，不是并发） |
 | `orch fan <步骤>` | 派发前踩四道刹车：路数（默认 2）/ 目录重叠 / 依赖深度（默认 3）/ 契约在不在。过了就一人一份自足式简报 |
-| `orch dispatch <步骤>` | 真派发：分批起 `opencode run`，按**会话 id 点名归账**，`--max-usd` 到顶就停手，`--retries` 在原会话里补跑 |
+| `orch dispatch <步骤>` | 真派发：分批起 `opencode run`，按**会话 id 点名归账**，`--max-usd`（账本累计口径）在**每批开之前**就查、超了连第 1 批都不派，`--retries` 在原会话里补跑 |
 | `orch rollup [--gate] [--cost]` | 三层分列汇总：断言（exit code 说话）/ 语义（reviewer 只出概率）/ 人（只在两层打架时介入） |
 
 四条不许破的：

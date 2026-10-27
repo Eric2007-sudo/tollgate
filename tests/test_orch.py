@@ -556,6 +556,32 @@ def main():
               for p in d["planned"]),
           repr([p["argv"][-1] for p in d["planned"]]))
 
+    # 刹车必须在**花钱之前**踩。只在「批后」检查的话，一批就完事的任务等于没刹车：
+    # 账本早就过了上限，第 1 批照样派出去，钱先花掉再说。这条是实测踩出来的。
+    droot2 = tempfile.mkdtemp(prefix="orch_brake_")
+    tg(["init", "刹车测试", "--why", "上限超了不许先花钱再停"], droot2)
+    tg(["add", "--title", "契约", "--out", "contract/C.md", "--rounds", "2",
+        "--reuse", "existing", "--accept", "file:exists:contract/C.md"], droot2)
+    os.makedirs(os.path.join(droot2, "contract"), exist_ok=True)
+    with open(os.path.join(droot2, "contract", "C.md"), "w", encoding="utf-8") as fh:
+        fh.write("# 契约\n\n字段名以这里为准。\n")
+    tg(["start", "1"], droot2)
+    tg(["done", "1"], droot2)
+    tg(["add", "--title", "一路", "--out", "out/", "--rounds", "4",
+        "--depends", "1", "--reuse", "new", "--accept", "file:exists:out/a.md"], droot2)
+    oc(["role", "add", "lead", "--dir", "plan/", "--lead", "--task", "拍板",
+        "--merge", "lead 看，合不上就拆步"], droot2)
+    oc(["role", "add", "be", "--dir", "api/", "--task", "出 app.py"], droot2)
+    with open(os.path.join(droot2, ".plan", "ledger.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": "2026-01-01T00:00:00", "step": 1, "in": 1, "out": 1,
+                             "reqs": 1, "cost": 5.0, "src": "test"}) + "\n")
+    r = oc(["dispatch", "2", "--max-usd", "1.0", "--max-fanout", "2",
+            "--concurrency", "1"], droot2, expect=1)
+    check("账本已超上限时第 1 批都不派（刹车在批前踩，不是批后记账）",
+          "一条会话都没起" in r.stderr and "5.000000" in r.stderr, r.stderr[:400])
+    check("被刹车挡住时角色目录一个都没建（说明真的没起会话）",
+          not os.path.isdir(os.path.join(droot2, "api")), "api/ 被建出来了")
+
     # 分批规则本身钉住：大脑先跑，其余切片；没有大脑就纯切片
     check("plan_batches：大脑先单跑",
           _orch.plan_batches(["lead", "a", "b", "c"], 2, "lead") ==
