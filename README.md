@@ -246,7 +246,8 @@ python orch.py rollup --gate --cost        三层汇总
 | 两者叠加 | 门禁全绿、产物却与目标相反 | 只有人工读产物才能发现 |
 
 修法：`reset` 不再碰 `note`；模板加 `{step_note}` 段；`prepare_fan` 对空 note 直接拒派。
-配套破坏性验证 `_scratch/verify_orch_emptynote.py`：空 note → exit 2；正常 note → 简报 2434 → 5487 字节。
+配套的破坏性验证（两向对照）：空 note → `orch dispatch` exit 2 拒派；正常 note → 简报 2434 → 5487 字节。
+这个脚本是本地调试件，未随仓库发布；`tests/test_orch.py` 里覆盖了同样的两向行为。
 
 ### 3.5 一个真实会话上的样子
 
@@ -350,8 +351,9 @@ python tests\check_doc_counts.py   # 真跑下面五个套件，并核对 README
 | `docs/architecture.md` | 模块划分与数据流 |
 | `docs/dogfood.md` | 一次真实任务的战报，含真实账本数字 |
 | `docs/jev-onboarding.md` | 语义层首次接入的验收台账与七个坑 |
-| `bench/REPORT-v0.2.md` | 四维评测台的完整交付报告（分账、缺陷、复现） |
-| `abtest-gate/METHOD.md` | A/B 的唯一变量表、四数定义、六条「不能支撑什么」 |
+
+> §3 里引用的 `bench` 与 A/B 实验是**另外两个本地项目**（agent 效率评测的实施对象），未随本仓库发布；
+> 这里只引用它们的实测数字，不引用它们的代码。
 
 ---
 
